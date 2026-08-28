@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react';
-import { connect, disconnect, fetchProfile, fetchReport } from '../lib/invoke';
-import type { ProfileView } from '../lib/invoke';
+import {
+  connect,
+  disconnect,
+  fetchProfile,
+  fetchReport,
+  kernelWindow,
+} from '../lib/invoke';
+import type { KernelWindowReply, ProfileView } from '../lib/invoke';
 import { useTaskStore } from './taskStore';
 import './SettingsPage.css';
 
@@ -17,6 +23,9 @@ export function SettingsPage() {
   const [reconnecting, setReconnecting] = useState(false);
   const [reporting, setReporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [kernelPid, setKernelPid] = useState('');
+  const [kernelBusy, setKernelBusy] = useState<'open' | 'close' | null>(null);
+  const [kernelReply, setKernelReply] = useState<KernelWindowReply | null>(null);
   const { clearAll } = useTaskStore();
 
   useEffect(() => {
@@ -53,6 +62,26 @@ export function SettingsPage() {
       setNotice(`重连失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setReconnecting(false);
+    }
+  }
+
+  function parseKernelPid(): number | null {
+    const n = parseInt(kernelPid, 10);
+    if (!Number.isInteger(n) || n <= 0 || n > 0xffffffff) return null;
+    return n;
+  }
+
+  async function onKernelWindow(phase: 'open' | 'close') {
+    setKernelBusy(phase);
+    setNotice(null);
+    try {
+      const reply = await kernelWindow(phase, parseKernelPid());
+      setKernelReply(reply);
+    } catch (e) {
+      setKernelReply(null);
+      setNotice(`内核时间窗失败: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setKernelBusy(null);
     }
   }
 
@@ -142,6 +171,53 @@ export function SettingsPage() {
           </dl>
         )}
         {!profile && !profileErr && <p className="settings-muted">读取中…</p>}
+      </section>
+
+      <section className="settings-card">
+        <h3>内核时间窗</h3>
+        <p className="settings-muted">
+          操作员发起（非 implant 信令）。open 失败即停；close 尽最大努力。当前 kit
+          无 undo，<span className="mono">restored: false / no undo op</span> 是诚实返回，不是
+          GUI 错误。inject / hashdump 下发前会尽力先 open；daemon 未配置（404）时任务仍下发。
+        </p>
+        <label className="settings-field">
+          <span>EDR PID（可选，neutralize freeze）</span>
+          <input
+            className="settings-input mono"
+            type="number"
+            min={1}
+            step={1}
+            value={kernelPid}
+            onChange={(e) => setKernelPid(e.target.value)}
+            placeholder="例如 1234"
+          />
+        </label>
+        <div className="settings-btn-row">
+          <button
+            type="button"
+            className="settings-btn"
+            disabled={kernelBusy !== null}
+            onClick={() => onKernelWindow('open')}
+          >
+            {kernelBusy === 'open' ? '打开中…' : '打开'}
+          </button>
+          <button
+            type="button"
+            className="settings-btn settings-btn-secondary"
+            disabled={kernelBusy !== null}
+            onClick={() => onKernelWindow('close')}
+          >
+            {kernelBusy === 'close' ? '关闭中…' : '关闭'}
+          </button>
+        </div>
+        {kernelReply && (
+          <>
+            <p className="settings-muted mono">HTTP {kernelReply.status}</p>
+            <pre className="settings-json mono">
+              {JSON.stringify(kernelReply.body, null, 2)}
+            </pre>
+          </>
+        )}
       </section>
 
       <section className="settings-card">

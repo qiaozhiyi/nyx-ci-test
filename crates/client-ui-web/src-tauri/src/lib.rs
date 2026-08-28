@@ -49,6 +49,7 @@ pub fn run() {
             commands::fetch_operators,
             commands::pick_file,
             commands::read_file_hex,
+            commands::kernel_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -10,7 +10,7 @@ import { SettingsPage } from './SettingsPage';
 import { FilesPage } from './FilesPage';
 import { Dock } from '../components/Dock';
 import { TaskStoreProvider, useTaskStore } from './taskStore';
-import { disconnect, onError, onSessions } from '../lib/invoke';
+import { disconnect, onError, onNotice, onSessions } from '../lib/invoke';
 import './App.css';
 
 // Topology is the only consumer of three.js; lazy-load it so the 3D engine
@@ -52,6 +52,7 @@ function AppInner() {
   const [connected, setConnected] = useState(false);
   const [activePage, setActivePage] = useState<Page>('workspace');
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Sessions live at the top level: both Workspace and Topology consume them.
   const [sessions, setSessions] = useState<SessionView[]>([]);
@@ -79,6 +80,22 @@ function AppInner() {
       if (unlisten) unlisten();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Kernel-window 502 etc. — not a dropped connection.
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    onNotice((msg) => {
+      setNotice(msg);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
   }, []);
 
   // Session list updates from the 2s poll loop (emitted by the Rust backend).
@@ -146,12 +163,24 @@ function AppInner() {
     <div className="app-shell">
       <Dock activePage={activePage} onPageChange={setActivePage} onDisconnect={handleDisconnect} />
       <main className="app-main">
-        {error && (
-          <div className="app-banner" role="alert">
-            <span className="app-banner-text">连接异常（自动重试中）: {error}</span>
-            <button type="button" className="app-banner-x" onClick={() => setError(null)}>
-              ×
-            </button>
+        {(error || notice) && (
+          <div className="app-banners">
+            {error && (
+              <div className="app-banner" role="alert">
+                <span className="app-banner-text">连接异常（自动重试中）: {error}</span>
+                <button type="button" className="app-banner-x" onClick={() => setError(null)}>
+                  ×
+                </button>
+              </div>
+            )}
+            {notice && (
+              <div className="app-banner app-banner--notice" role="status">
+                <span className="app-banner-text">{notice}</span>
+                <button type="button" className="app-banner-x" onClick={() => setNotice(null)}>
+                  ×
+                </button>
+              </div>
+            )}
           </div>
         )}
         {activePage === 'workspace' && (

@@ -36,6 +36,9 @@ pub struct PendingTask {
 pub struct BackendState {
     pub connection: Arc<RwLock<Option<Connection>>>,
     pub pending: Arc<RwLock<Vec<PendingTask>>>,
+    /// Last EDR pid supplied to Settings Open/Close; reused by auto-open on
+    /// inject/hashdump. Not the inject target pid.
+    pub kernel_pid: Arc<RwLock<Option<u32>>>,
 }
 
 impl BackendState {

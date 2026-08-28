@@ -65,6 +65,14 @@ export function onError(cb: (msg: string) => void): Promise<UnlistenFn> {
   return listen<string>('nyx://error', (e) => cb(e.payload));
 }
 
+/**
+ * Non-fatal operator notices (kernel window 502, etc.).
+ * Unlike `nyx://error`, this is not a team-server outage.
+ */
+export function onNotice(cb: (msg: string) => void): Promise<UnlistenFn> {
+  return listen<string>('nyx://notice', (e) => cb(e.payload));
+}
+
 // ===== Credentials =====
 
 /** CredRecord from server (crates/store/src/model.rs). */
@@ -199,4 +207,19 @@ export interface ProfileView {
 // Wired by the Settings page (shows the loaded Malleable profile).
 export function fetchProfile(): Promise<ProfileView> {
   return invoke('fetch_profile');
+}
+
+// ===== Kernel time-window (T2) =====
+
+export interface KernelWindowReply {
+  status: number;
+  body: unknown;
+}
+
+/** `POST /api/kernel/window`. HTTP 404/502 still resolve (body shown as-is). */
+export function kernelWindow(
+  phase: 'open' | 'close',
+  pid?: number | null,
+): Promise<KernelWindowReply> {
+  return invoke('kernel_window', { phase, pid: pid ?? null });
 }

@@ -13,14 +13,18 @@
   position: relative;
 }
 
-/* Non-fatal backend outage banner (poll loop keeps retrying underneath).
-   Overlays the page top instead of reflowing the layout. */
-.app-banner {
+/* Non-fatal banners overlay the page top instead of reflowing the layout. */
+.app-banners {
   position: absolute;
   top: 0;
   left: 0;
   right: 0;
   z-index: 50;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-banner {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -29,6 +33,11 @@
   color: var(--warn-fg, #e8b45a);
   border-bottom: 1px solid var(--border, #444);
   font-size: 12px;
+}
+
+.app-banner--notice {
+  background: var(--info-bg);
+  color: var(--info);
 }
 
 .app-banner-text {

