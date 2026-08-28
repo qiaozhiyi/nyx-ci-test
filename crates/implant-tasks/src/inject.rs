@@ -174,6 +174,30 @@ pub unsafe fn create_sacrificial_running(
     unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &app, &mut si, &mut pi, 0, false) }
 }
 
+/// Spawn `app` RUNNING with a caller-built UTF-16 command line.
+///
+/// `create_sacrificial_running` copies `spawn_to` into BOTH lpApplicationName
+/// and lpCommandLine, so `"C:\\path\\probe.exe --hold-tp"` would be treated as
+/// the image name (CreateProcessW fails). Pool Party's hosted selftest needs
+/// the probe binary as the image and `"probe.exe" --hold-tp` as the command
+/// line so the child is a different PID with a live TpWorkerFactory.
+///
+/// `app` and `cmd` must be NUL-terminated. `cmd` is mutable because Win32
+/// may rewrite lpCommandLine.
+///
+/// # Safety
+/// Same contract as [`create_sacrificial_running`].
+pub unsafe fn create_sacrificial_running_wide(
+    app: &[u16],
+    cmd: &mut [u16],
+) -> Result<SacrificialProcess, &'static str> {
+    let create_proc = unsafe { create_sacrificial_resolve() }?;
+    let mut si = [0u8; 104];
+    si[0..4].copy_from_slice(&104u32.to_le_bytes());
+    let mut pi = [0u8; 24];
+    unsafe { create_sacrificial_spawn(create_proc, cmd, app, &mut si, &mut pi, 0, false) }
+}
+
 /// `CreateProcessW` (kernel32) — resolved via PEB walk for the sacrificial
 /// process spawn.
 type CreateProcessW = unsafe extern "system" fn(

