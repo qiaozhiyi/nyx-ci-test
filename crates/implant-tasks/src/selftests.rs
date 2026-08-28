@@ -591,8 +591,10 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
 // bit2 = degraded with WARN prefix to module_stomp (section delivery ran).
 // bit3 = SKIP FLAG (not a pass): env skip — no worker-factory in the target,
 //        or OpenProcess failed (GLE=5 ACCESS_DENIED / pid gone).
-//        Distinct from 0x5 WARN-fail. Expected: 0x7 pass / 0x9 skip
-//        (bit0+bit3) / 0x5 WARN-fail. Never treat 0x9 as success.
+//        Distinct from 0x5 WARN-fail. Expected: 0x3 pass (bit0+bit1) /
+//        0x9 skip (bit0+bit3) / 0x5 WARN-fail. 0x7 would require bit2
+//        (WARN degrade) which is mutually exclusive with bit1. Never
+//        treat 0x9 as success. Hosted 52df502: exit 3 + inject ok.
 // The raw Err string (pool_party's own error, or the WARN-prefixed fallback
 // failure) is persisted to %TEMP%\nyx_g6_inject_pool.resp for VM triage;
 // %TEMP%\nyx_g6_inject_pool.target records which sacrificial image was used.

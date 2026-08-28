@@ -162,11 +162,13 @@ jobs:
           Write-Host "CRT3 sleeper OK: $sz bytes at $out"
 
       # Pass masks (scripts/win_selftest_all.ps1 2026-08-24 comments +
-      # selftests.rs): armed=0xF, pool=0x7 (0x5 = WARN-degraded to method 2,
+      # selftests.rs): armed=0xF, pool=0x3 (bit0 spawn + bit1 inject ok;
+      # 0x5 = WARN-degraded to method 2,
       # recorded as pool_party FAILURE per edr-quant-matrix.md §5; 0x9 is
       # not a pass — CRT3 sleeper is deployed above so a worker factory
       # should exist; 0x9 now means the product still cannot find one.
-      # Do not add 0x9 to PassCodes), fls=0x7, hwbp=0xFF, syscall_rt=0b11,
+      # Do not add 0x9 to PassCodes. 52df502: real pass is 0x3 not 0x7),
+      # fls=0x7, hwbp=0xFF, syscall_rt=0b11,
       # vad=0x7, threadless=0x7, fluctuation=0x7. Hosted runner is native x64
       # Server 2025 — the Prism env-skip codes (0xB/0x1D/0xC1) must NOT
       # appear here.
@@ -178,7 +180,7 @@ jobs:
           $evidence = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           $rows = @(
             @{ T = "module_stomp";     E = "nyx_selftest_inject_armed";      P = @(0xF) },
-            @{ T = "pool_party";       E = "nyx_selftest_inject_pool";       P = @(0x7) },
+            @{ T = "pool_party";       E = "nyx_selftest_inject_pool";       P = @(0x3) },
             @{ T = "fls_callback";     E = "nyx_selftest_inject_fls";        P = @(0x7) },
             @{ T = "hwbp_blind";       E = "nyx_selftest_hwbp_blind";        P = @(0xFF) },
             @{ T = "indirect_syscall"; E = "nyx_selftest_syscall_rt";        P = @(0x3) },

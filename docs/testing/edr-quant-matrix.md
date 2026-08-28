@@ -83,7 +83,7 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 | 日期 | 技术 | EDR（版本） | 投递 | 样本 | 成功率 | 告警 | 环境限制 | 证据 |
 |---|---|---|---|---|---|---|---|---|
 | 2026-08-24 | module_stomp | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | [run 32680867069](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/32680867069) |
-| 2026-08-24 | pool_party | Microsoft Defender 4.18.26070.9 | exe | 1 | 0.0% | 0 | Defender 已关闭 | 同上；08-24 exit 0x5；08-28 0.0% notepad 无 TP → `refuse self-inject` → `--hold-tp` 仍 9（33139170290）；QUERY 类 7 修复后的下次 hosted 跑才是实测 |
+| 2026-08-24 | pool_party | Microsoft Defender 4.18.26070.9 | exe | 1 | 0.0% | 0 | Defender 已关闭 | 08-24 exit 0x5；08-28 路径修到 52df502 Windows CI `Pool Party inject ok` 出口 3。矩阵 0.0% 是 PassCodes 误要 0x7；下跑 PassCodes=0x3 才记 100% |
 | 2026-08-24 | fls_callback | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上；`fls callback inject ok` |
 | 2026-08-24 | hwbp_blind | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
 | 2026-08-24 | indirect_syscall | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
@@ -154,7 +154,7 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 |---|---|---|---|
 | module_stomp | `nyx_selftest_inject_armed`（真 stomp 全路径） | `inject 0 <hex> 2`；`inject <pid> <hex> 2` 走现有进程变体 | 目标进程必须 x64（仿真进程），不可注入 ARM64 原生进程 |
 | threadless | `nyx_selftest_inject_threadless`（08-28 安全前缀：牺牲进程 + alloc/write/protect-to-RX + cleanup，1 字节 `ret`，不 RIP 劫持，期望 0x7；hosted 可驱） | `inject 0 <hex> 1` | 仅牺牲进程路径；operator 命令才跑完整 RIP 劫持（需桌面 live C2，不在 hosted job 内） |
-| pool_party | `nyx_selftest_inject_pool`（导出内强制 gate ON；best-effort。0x7 成功 / 0x5 WARN 降级 method 2 = 失败 / 0x9 = 环境 skip：目标无 worker factory 或 OpenProcess 失败 / 出口 1 = 曾打到自身 pid 被 `refuse self-inject`） | `inject <pid> <hex> 0`（需构建期 gate + pid≠0） | 响应含 `WARN: Pool Party` 前缀 = 已降级 method 2，本条应记为 pool_party 失败而非成功；0x9 记 skip 而非失败或成功。hosted 靶是探针 `--hold-tp` 子进程（不同 PID）；rundll32 回退 CRT3_SLEEPER。不预填 100% |
+| pool_party | `nyx_selftest_inject_pool`（导出内强制 gate ON。0x3 成功：bit0 牺牲进程 + bit1 `Pool Party inject ok` / 0x5 WARN 降级 method 2 = 失败 / 0x9 = 环境 skip） | `inject <pid> <hex> 0`（需构建期 gate + pid≠0） | 响应含 `WARN: Pool Party` 前缀 = 已降级 method 2，本条应记为 pool_party 失败。hosted 52df502：`--hold-tp` pid 上 `Pool Party inject ok`，出口 3。门禁曾误要 0x7（含 WARN bit2）。 |
 | fls_callback | `nyx_selftest_inject_fls`（RUNNING notepad 牺牲进程 + 1 字节 ret 探针） | `inject <pid> <hex> 3` 或 `inject 0 <hex> 3` | 牺牲进程必须 RUNNING（suspended 无 kernel32 映射） |
 | fluctuation | `nyx_selftest_fluctuation`（08-28 安全前缀：scratch 页 NOACCESS→RX 往返；**不**翻转 implant `.text`；期望 0x7；hosted 可驱） | `sleep <秒>` 后观察 beacon 存活与告警 | ARM64 仿真下降级为纯 sleep，`env_limit` 必须标 `Prism 仿真降级`。operator `sleep` 全路径仍需真 C2 会话 |
 | vad | `nyx_selftest_vad`（08-28：walk + image RX + scratch leftover gone，期望 0x7；hosted 可驱） | —（自检，非 inject method） | Session-0 安全；经 nyx-bof-isolated-probe 驱动 |

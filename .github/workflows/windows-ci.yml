@@ -371,7 +371,9 @@ jobs:
       # from the implant build step. CRT3 sleeper is deployed before B4, so
       # inject_pool must find a worker factory — exit 9 is a product FAIL.
       #   vad / inject_threadless / fluctuation: expect 7 (0b0111)
-      #   inject_pool: 7 pass; 9 (no worker factory) FAIL; 5 WARN-degrade FAIL
+      #   inject_pool: 3 pass (bit0 spawn + bit1 Pool Party ok). 7 was a
+      #     mistaken "all bits" that included WARN bit2. 9 no factory FAIL;
+      #     5 WARN-degrade FAIL. Hosted 52df502: exit 3 + "Pool Party inject ok".
       #   cfgstage: unpatched CI template first byte 0x41 (65); FAIL on
       #             probe 0xE0/0xE1, timeout, or 0x61-0x64 (locate/decrypt/
       #             parse/empty host).
@@ -424,8 +426,8 @@ jobs:
                 Write-Host ("--- {0} ---" -f $_.Name)
                 Get-Content $_.FullName -ErrorAction SilentlyContinue
               }
-              if ($code -eq 7) {
-                Write-Host "::notice::$t PASS (mask=7: sacrificial + pool party ok)"
+              if ($code -eq 3) {
+                Write-Host "::notice::$t PASS (mask=3: sacrificial + pool party ok)"
               } elseif ($code -eq 9) {
                 # Sleeper is deployed; skip means the product still cannot find
                 # a worker factory. Fail the job (do not treat 9 as env-skip).
@@ -435,7 +437,7 @@ jobs:
                 Write-Host "::error::$t exit 5 (WARN degrade to method 2) — Pool Party did not run; failing the job"
                 $failed += "$t=5"
               } else {
-                Write-Host "::error::$t expected 7 (pass); got $code"
+                Write-Host "::error::$t expected 3 (bit0+bit1 pass); got $code"
                 $failed += ("{0}={1}" -f $t, $code)
               }
             } elseif ($t -eq "nyx_selftest_cfgstage") {
