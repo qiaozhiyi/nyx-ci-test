@@ -41,15 +41,15 @@
 //! can downgrade themselves.
 //!
 //! ## Status
-//! Seam surface is canonical and exhaustive; 8 of the 9 traits have LIVE
-//! impls: `PdataGapScanner`, `StackSpoofKit`, `BlindKit`, `MemoryMaskKit`,
-//! `SyscallProvider` (`LiveSyscalls`), `UnhookKit` (`LiveUnhook`) and
-//! `AntiDebugKit` (`LiveAntiDebug`) in `implant-evasion/src/evasion_glue.rs`,
-//! plus `ProcessInjectKit` (`ModuleStomper`) in `nyx-implant-tasks::inject`.
-//! The one remaining floor is `SleepmaskKit`: the shipped Fluctuation sleep
-//! mask still lives behind the legacy `kits.rs` trait in `nyx-implant-tasks`
-//! (migration to this seam pending), so the seam default stays the honest
-//! no-op. Research-grounded technique lists per trait come from
+//! Seam surface is canonical and exhaustive; all 9 traits have LIVE impls:
+//! `PdataGapScanner`, `StackSpoofKit`, `BlindKit`, `MemoryMaskKit`,
+//! `SyscallProvider` (`LiveSyscalls`), `UnhookKit` (`LiveUnhook`),
+//! `AntiDebugKit` (`LiveAntiDebug`) and `SleepmaskKit` (`LiveSleepmask`) in
+//! `implant-evasion/src/evasion_glue.rs`, plus `ProcessInjectKit`
+//! (`ModuleStomper`) in `nyx-implant-tasks::inject`. `LiveSleepmask` is
+//! independent opt-in: the default `EvasionStack` keeps the `Floors`
+//! sleepmask, and production sleep routing stays in `nyx-implant-tasks::kits`
+//! (do not double-wire). Research-grounded technique lists per trait come from
 //! `docs/p2-2026-h2-latest-sweep.md`, `docs/p2-2026-kernel-tier-deepdive.md`,
 //! and the root research corpus.
 
@@ -261,11 +261,13 @@ impl SpoofGuard {
 /// external sleep). **Invariant:** on return the image + every thread stack is
 /// byte-identical to entry.
 ///
-/// Planned impls: `NoMask` (floor), `Ekko` (SystemFunction032 RC4 +
-/// WaitForSingleObject), `InsomniacUnwinding` (stomp + register .pdata +
-/// mask memory only — no spoof-during-sleep, CET-clean), `Zilean`, `DreamWalkers`.
-/// (`Foliage` was implemented and deliberately removed — commit 841ffc5 —
-/// superseded by the Fluctuation sleep mask in `implant-evasion`.)
+/// Planned impls: `NoMask` (floor), `Fluctuation` (PAGE_NOACCESS `.text`
+/// flip — shipped as `LiveSleepmask` in `implant-evasion`; production beacon
+/// sleep stays in `nyx-implant-tasks::kits`, this seam is independent opt-in),
+/// `Ekko` (SystemFunction032 RC4 + WaitForSingleObject), `InsomniacUnwinding`
+/// (stomp + register .pdata + mask memory only — no spoof-during-sleep,
+/// CET-clean), `Zilean`, `DreamWalkers`. (`Foliage` was implemented and
+/// deliberately removed — commit 841ffc5 — superseded by Fluctuation.)
 pub trait SleepmaskKit {
     /// Own the mask → sleep → unmask window. Returns `Err` (e.g.
     /// [`EvasionError::NoFloor`]) when no real sleep-mask impl is wired, so
@@ -520,6 +522,28 @@ impl EvasionStack {
             self.gap_pool = pool;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default stack and Floors stay honest for SleepmaskKit: NoFloor, not a
+    /// silent no-op. The live Fluctuation impl is `LiveSleepmask` in
+    /// implant-evasion (opt-in; not assembled into `EvasionStack::floor()`).
+    #[test]
+    fn floors_sleepmask_still_returns_no_floor() {
+        let gaps = GapPool::default();
+        assert!(matches!(
+            Floors.sleep_masked(0, &gaps),
+            Err(EvasionError::NoFloor("SleepmaskKit"))
+        ));
+        let stack = EvasionStack::floor();
+        assert!(matches!(
+            stack.sleepmask.sleep_masked(0, &gaps),
+            Err(EvasionError::NoFloor("SleepmaskKit"))
+        ));
     }
 }
 

