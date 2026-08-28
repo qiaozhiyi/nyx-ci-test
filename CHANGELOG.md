@@ -14,7 +14,7 @@ this file and the code disagree, the code wins.
 
 2026-08-28 hosted-fix（CRT3 sleeper + WFP 出站 + probe `--hold-tp`；Pool Party 证据待下次 nyx-ci-test）：
 
-- **Pool Party**：52df502 Windows CI [33141163143](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33141163143) **`Pool Party inject ok`**，出口 3。门禁曾要 0x7（误含 WARN bit2）。现硬门与矩阵 PassCodes 改为 0x3。
+- **Pool Party**：hosted 已绿。Windows CI [33141408224](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33141408224) `inject_pool` 出口 3 PASS；Hosted Verify [33141405429](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33141405429) 矩阵 **pool_party 100.0%**（8/8 技术 100%、0 告警）；Win BYOVD [33141406810](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33141406810) 含 WFP 全绿。通过码是 0x3（spawn+ok），不是 0x7。
 - **WFP**：hosted `blocked=false` 是 loopback 分类（IS_LOOPBACK / RECV_ACCEPT PERMIT），不是缺 filter。`wfp-selftest` 现测出站 `1.1.1.1:443`（回退 `8.8.8.8`/`9.9.9.9`；无出口记 `env_limit` 退出 6）。Win BYOVD [33136778239](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33136778239) 已绿。
 
 2026-08-28 Windows 用户态收口（文档口径，不编造 CI 数字）：

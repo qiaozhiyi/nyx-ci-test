@@ -78,12 +78,13 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 
 目标：GitHub hosted `windows-latest`（Server 2025，原生 x64，非 Prism）。Defender 实时保护在该镜像上 **开不起来**（`Set-MpPreference` 无效），行一律 `env_limit=Defender 已关闭`——功能结果，**不是**检测结果。告警差值为 0 不得外推为“免杀”。CSV：artifact `edr-matrix-32680867069`。
 
-2026-08-28 closeout（`windows-closeout` / nyx-ci-test run [33135025777](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135025777)）：同一 job 扩到 8 行。vad / threadless 安全前缀 / fluctuation scratch 均为 100%、0 告警。pool_party 仍 0.0%——08-28 先是 notepad 无 TP，后是 `refuse self-inject`，`--hold-tp` 子进程后 Windows CI [33139170290](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33139170290) 仍出口 9。产品劫持查询类曾是 SET 2 而非 QUERY 7。不是预填成功；下次 hosted 跑才是实测，本表不预填 100%。`env_limit` 仍是 Defender 已关闭。完整 operator RIP 劫持 / 真 beacon `sleep` 仍需桌面 C2 会话（§5）。
+2026-08-28 closeout（`windows-closeout` / Hosted Verify [33141405429](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33141405429)）：同一 job 8 行均为 100%、0 告警，**含 pool_party 100.0%**（`inject_pool` 出口 3）。`env_limit` 仍是 Defender 已关闭。完整 operator RIP 劫持 / 真 beacon `sleep` 仍需桌面 C2 会话（§5）。
 
 | 日期 | 技术 | EDR（版本） | 投递 | 样本 | 成功率 | 告警 | 环境限制 | 证据 |
 |---|---|---|---|---|---|---|---|---|
 | 2026-08-24 | module_stomp | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | [run 32680867069](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/32680867069) |
-| 2026-08-24 | pool_party | Microsoft Defender 4.18.26070.9 | exe | 1 | 0.0% | 0 | Defender 已关闭 | 08-24 exit 0x5；08-28 路径修到 52df502 Windows CI `Pool Party inject ok` 出口 3。矩阵 0.0% 是 PassCodes 误要 0x7；下跑 PassCodes=0x3 才记 100% |
+| 2026-08-24 | pool_party | Microsoft Defender 4.18.26070.9 | exe | 1 | 0.0% | 0 | Defender 已关闭 | 08-24 exit 0x5 WARN 降级（句柄表偏移已修）；不是 08-28 收口结果 |
+| 2026-08-28 | pool_party | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | [run 33141405429](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33141405429)；`inject_pool` 出口 3（`--hold-tp` + `TpWorkerFactory` 类型名 + variant 1 ThreadMinimum） |
 | 2026-08-24 | fls_callback | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上；`fls callback inject ok` |
 | 2026-08-24 | hwbp_blind | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
 | 2026-08-24 | indirect_syscall | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
