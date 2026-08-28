@@ -14,7 +14,7 @@ this file and the code disagree, the code wins.
 
 2026-08-28 Windows 用户态收口（文档口径，不编造 CI 数字）：
 
-- **探针覆盖**：Hosted Verify 与 windows-ci 控制台探针现覆盖 `nyx_selftest_vad`、threadless SAFE 前缀（`nyx_selftest_inject_threadless`）、fluctuation scratch（`nyx_selftest_fluctuation`，不翻 implant `.text`）、pool 复跑（`nyx_selftest_inject_pool`）、cfgstage 未补丁 `0x41`（未补丁模板回显首字节，不是伪造通过）。用户态收口待本波次 hosted 证据。
+- **探针覆盖（已有 hosted 证据）**：nyx-ci-test `windows-closeout` — Hosted Verify [33135025777](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135025777) 与 Windows CI [33135028358](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135028358) 全绿。`vad`/`inject_threadless`/`fluctuation` 出口 7；`cfgstage` 未补丁 `0x41`；`inject_pool` Windows CI 为 0x9 env-skip，矩阵 pool_party 仍 0.0%（WARN 降级）。Win BYOVD [33135027007](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135027007) 的 wfp-selftest 仍 `blocked=false`（operator kit，非 implant）。
 - **PIC `bof-host` inject 刻意 Unresolved**：`BeaconInjectProcess`/`BeaconInjectTemporaryProcess` 保持带名 Unresolved——牺牲子进程无 kernel32；ntdll `NtCreateThreadEx` 会破无写静态/PIC dumper。std `bof-runner` 已有 RW→RX。这是文档化限制，不是未修 bug。
 - **永久环境阻塞（不排期）**：CET 物理机、HVCI-on 嵌套虚拟化、CrowdStrike/SentinelOne 企业盘、NDR 长驻流量、Defender 实时保护在 GitHub Server 2025 hosted（矩阵行保持 `env_limit=Defender 已关闭`，功能结果不是检测结果）。
 - **MDE / 第三方 EDR**：可选限时试验，不是合入门禁。

@@ -78,7 +78,7 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 
 目标：GitHub hosted `windows-latest`（Server 2025，原生 x64，非 Prism）。Defender 实时保护在该镜像上 **开不起来**（`Set-MpPreference` 无效），行一律 `env_limit=Defender 已关闭`——功能结果，**不是**检测结果。告警差值为 0 不得外推为“免杀”。CSV：artifact `edr-matrix-32680867069`。
 
-2026-08-28：`nyx_selftest_vad` / `nyx_selftest_inject_threadless` / `nyx_selftest_fluctuation` 已是 Session-0 安全前缀，`windows-hosted-verify.yml` 的 `edr-matrix` job 经 nyx-bof-isolated-probe 驱动（期望 0x7）。下表 08-24 五行仍是当时实测，**不**虚构新数字；threadless/fluctuation **不再**标“无 hosted 可驱导出”。完整 operator RIP 劫持 / 真 beacon `sleep` 仍需桌面 C2 会话（§5）。
+2026-08-28 closeout（`windows-closeout` / nyx-ci-test run [33135025777](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135025777)）：同一 job 扩到 8 行。vad / threadless 安全前缀 / fluctuation scratch 均为 100%、0 告警。pool_party 仍 0.0%（WARN 降级 method 2；Windows CI 同镜像上 `nyx_selftest_inject_pool` 出口 0x9 env-skip）。`env_limit` 仍是 Defender 已关闭。完整 operator RIP 劫持 / 真 beacon `sleep` 仍需桌面 C2 会话（§5）。
 
 | 日期 | 技术 | EDR（版本） | 投递 | 样本 | 成功率 | 告警 | 环境限制 | 证据 |
 |---|---|---|---|---|---|---|---|---|
@@ -87,9 +87,9 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 | 2026-08-24 | fls_callback | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上；`fls callback inject ok` |
 | 2026-08-24 | hwbp_blind | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
 | 2026-08-24 | indirect_syscall | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
-| — | threadless | — | — | — | — | — | — | 08-28 安全前缀 `nyx_selftest_inject_threadless`（spawn+alloc/write/RX+cleanup，1 字节 `ret`，不 RIP 劫持，期望 0x7）已 hosted 可驱；完整 operator RIP 劫持仍需真 C2 会话（§5）。尚无实测数字 |
-| — | fluctuation | — | — | — | — | — | — | 08-28 安全前缀 `nyx_selftest_fluctuation`（scratch PAGE_NOACCESS→RX，不翻 implant `.text`，期望 0x7）已 hosted 可驱；operator `sleep` 全路径仍需真 C2 会话（§5）。尚无实测数字 |
-| — | vad | — | — | — | — | — | — | 08-28 `nyx_selftest_vad`（walk + image RX + scratch leftover gone，期望 0x7）已 hosted 可驱。尚无实测数字 |
+| 2026-08-28 | threadless | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | [run 33135025777](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135025777)；安全前缀（不 RIP 劫持） |
+| 2026-08-28 | fluctuation | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上；scratch NOACCESS→RX，不翻 implant `.text` |
+| 2026-08-28 | vad | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上；walk + image RX + scratch leftover gone |
 
 ### 3.1 ARM64 VM + Defender 实时保护 ON（待实测）
 
