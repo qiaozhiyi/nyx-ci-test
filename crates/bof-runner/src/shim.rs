@@ -1310,6 +1310,13 @@ fn push_hex_upper64(v: u64) {
 mod tests {
     use super::*;
 
+    /// One lock for every test that touches the process-global BOF capture
+    /// buffer (`nyx_bof_reset` / `nyx_bof_output` / `BeaconOutput`). Nested
+    /// `static LOCK`s per helper did not serialize format vs output tests;
+    /// extra inject tests on Windows CI made `bare_x_still_truncates_to_u32`
+    /// read an empty C string (`"\0"` instead of `"0"`).
+    static SHIM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Reset the capture buffer, run `format_into` with the given args + a
     /// Rust `&str` fmt (NUL-terminated on the stack), and return the captured
     /// output. Drives every test below.
@@ -1321,8 +1328,7 @@ mod tests {
         // (observed on native-Windows CI: a %s test asserting the 4096 cap
         // read 4178 bytes = its own 4096 plus another test's digits). The
         // production BOF path runs on one worker thread and is untouched.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap();
+        let _g = SHIM_TEST_LOCK.lock().unwrap();
         nyx_bof_reset();
         // Put a NUL terminator after the bytes; the fmt string in real BOFs is
         // also NUL-terminated. Capacity +1 guarantees room for it.
@@ -1758,8 +1764,7 @@ mod tests {
 
     #[test]
     fn beacon_output_appends_raw_bytes() {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap();
+        let _g = SHIM_TEST_LOCK.lock().unwrap();
         nyx_bof_reset();
         // Non-UTF8 byte included: BeaconOutput appends raw bytes verbatim.
         let blob = b"RAW-OUT\x01\xff";
@@ -2066,6 +2071,9 @@ mod tests {
 
     #[test]
     fn inject_temporary_live_fire_ret_into_spawned_process() {
+        // Hold the shim lock so CreateProcess/CreateRemoteThread cannot run
+        // over another test's capture-buffer critical section.
+        let _g = SHIM_TEST_LOCK.lock().unwrap();
         // Spawn suspended cmd.exe, inject a 1-byte `ret` (0xC3) via the CS
         // spawn-then-inject path, then terminate + cleanup. Does not resume
         // the primary thread (CS inject starts a remote thread; the BOF resumes).

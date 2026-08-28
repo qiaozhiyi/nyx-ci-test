@@ -236,9 +236,11 @@ pub(crate) fn window_plan(phase: WindowPhase) -> &'static [&'static str] {
 /// Daemon restore op for a window kit, if kernelsdk already has undo.
 ///
 /// None of the default-window kits expose restore today:
+///
 /// - `EtwTiKit` has `blind` / `is_blinded`, not unblind (do not invent a write of 1).
 /// - `CallbackKit::repurpose` / `EdrNeutralize` freeze do not snapshot originals.
 /// - `MiniFilterUnlinker::unlink_filter` self-loops the victim; no relink.
+///
 /// Close reports `restored: false, reason: "no undo op"` rather than lying.
 pub(crate) fn window_undo_op(_op: &str) -> Option<&'static str> {
     None

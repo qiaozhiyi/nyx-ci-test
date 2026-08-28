@@ -60,9 +60,9 @@ pub mod hashdump;
 // (its internals carry their own gates); keep that exact form.
 pub mod inject;
 // Cover-DLL pool + RX protect constants — host-testable (no Windows APIs).
-pub mod stealth;
 #[cfg(target_os = "windows")]
 pub mod keylog;
+pub mod stealth;
 // kits additionally carries a file-level `#![cfg(target_os = "windows")]`;
 // the outer gate here mirrors its declaration in the shell crate.
 #[cfg(target_os = "windows")]

