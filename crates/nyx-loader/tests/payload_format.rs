@@ -139,8 +139,15 @@ fn on_target_constants_are_accessible() {
     let _ = on_target::HASH_VIRTUAL_ALLOC;
     let _ = on_target::HASH_LOAD_LIBRARY_A;
     let _ = on_target::HASH_GET_PROC_ADDRESS;
+    let _ = on_target::HASH_VIRTUAL_PROTECT;
     let _ = on_target::MEM_COMMIT_RESERVE;
+    let _ = on_target::PAGE_READONLY;
+    let _ = on_target::PAGE_READWRITE;
+    let _ = on_target::PAGE_EXECUTE_READ;
     let _ = on_target::PAGE_EXECUTE_READWRITE;
+    let _ = on_target::IMAGE_SCN_MEM_EXECUTE;
+    let _ = on_target::IMAGE_SCN_MEM_WRITE;
+    let _ = on_target::section_protect_from_characteristics(0);
     let _ = on_target::DLL_PROCESS_ATTACH;
     let _ = on_target::LAYER2_JMP_OFFSET;
     let _ = on_target::LAYER2_ENTRY_OFFSET;

