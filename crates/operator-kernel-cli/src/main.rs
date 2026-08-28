@@ -1120,7 +1120,9 @@ fn op_wfp_selftest() -> i32 {
         path_match,
     );
     if restored {
-        eprintln!("[+] wfp-selftest PASS (baseline → blocked → restored, 1 filter, no residue)");
+        eprintln!(
+            "[+] wfp-selftest PASS (baseline → blocked → restored, {filters} filter(s), no residue)"
+        );
         0
     } else {
         eprintln!("[!] wfp-selftest FAIL: residue — connect still blocked after guard drop");
