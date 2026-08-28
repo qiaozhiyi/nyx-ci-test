@@ -14,7 +14,7 @@ this file and the code disagree, the code wins.
 
 2026-08-28 hosted-fix（CRT3 sleeper + WFP 出站 + probe `--hold-tp`；Pool Party 证据待下次 nyx-ci-test）：
 
-- **Pool Party**：cb77dfb 出口 5，`BasicInformation` 查询失败（factory 已按类型名命中）。现 8 字节对齐缓冲、记下 NTSTATUS、类型命中后再 DuplicateHandle `WORKER_FACTORY_ALL_ACCESS`。不预填 100%。
+- **Pool Party**：5afd0f5 出口 5，`BasicInformation` `st=0xC0000004 ret=120`（256 字节缓冲仍 LENGTH_MISMATCH）。现按 ReturnLength=120 重试，字段够用则接受缓冲。不预填 100%。
 - **WFP**：hosted `blocked=false` 是 loopback 分类（IS_LOOPBACK / RECV_ACCEPT PERMIT），不是缺 filter。`wfp-selftest` 现测出站 `1.1.1.1:443`（回退 `8.8.8.8`/`9.9.9.9`；无出口记 `env_limit` 退出 6）。Win BYOVD [33136778239](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33136778239) 已绿。
 
 2026-08-28 Windows 用户态收口（文档口径，不编造 CI 数字）：

