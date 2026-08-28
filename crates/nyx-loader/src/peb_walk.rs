@@ -434,19 +434,22 @@ mod tests {
     fn djb2_known_module_hashes_are_stable() {
         // Pin the hashes the on-target trampoline bakes in. If djb2 ever
         // changes these, the trampoline's hash table silently breaks, so this
-        // test is the canary: the four bootstrap names must hash to four
-        // distinct values (no collisions) and each must be stable on recompute.
+        // test is the canary: the bootstrap names must hash to distinct
+        // values (no collisions) and each must be stable on recompute.
         let h_ntdll = djb2(b"ntdll.dll");
         let h_k32 = djb2(b"kernel32.dll");
         let h_ntalloc = djb2(b"NtAllocateVirtualMemory");
         let h_loadlib = djb2(b"LoadLibraryA");
-        let mut seen: Vec<u32> = vec![h_ntdll, h_k32, h_ntalloc, h_loadlib];
+        let h_vprotect = djb2(b"VirtualProtect");
+        let mut seen: Vec<u32> = vec![h_ntdll, h_k32, h_ntalloc, h_loadlib, h_vprotect];
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), 4, "djb2 must not collide on the bootstrap APIs");
+        assert_eq!(seen.len(), 5, "djb2 must not collide on the bootstrap APIs");
         // Recomputing the same name must be idempotent.
         assert_eq!(djb2(b"ntdll.dll"), h_ntdll);
         assert_eq!(djb2(b"kernel32.dll"), h_k32);
+        assert_eq!(djb2(b"VirtualProtect"), h_vprotect);
+        assert_eq!(h_vprotect, crate::on_target::HASH_VIRTUAL_PROTECT);
     }
 
     // ── structure layout tests (the field offsets are load-bearing) ───────
