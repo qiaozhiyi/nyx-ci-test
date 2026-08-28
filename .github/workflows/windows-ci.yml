@@ -313,7 +313,7 @@ jobs:
           $prevEap = $ErrorActionPreference
           $ErrorActionPreference = 'Continue'
           try {
-            cmd /c "call `"$vcvars`" && cl /nologo /O2 /Fe:$out $src" 2>&1 |
+            cmd /c "call `"$vcvars`" && cl /nologo /O2 /Fe:$out $src /link /SUBSYSTEM:WINDOWS" 2>&1 |
               Out-String | Write-Host
             if ($LASTEXITCODE -ne 0) { throw "cl.exe exited $LASTEXITCODE" }
           } finally {

@@ -15,7 +15,7 @@
 //
 // Build (either compiler; SubmitThreadpoolWork on the default pool creates
 // the worker factory Pool Party scans for):
-//   cl /nologo /O2 /Fe:nyx_x64_sleeper.exe crt_probe3_sleeper.c
+//   cl /nologo /O2 /Fe:nyx_x64_sleeper.exe crt_probe3_sleeper.c /link /SUBSYSTEM:WINDOWS
 //   x86_64-w64-mingw32-gcc -O2 -o nyx_x64_sleeper.exe crt_probe3_sleeper.c
 // Deploy: C:\nyx_test\nyx_x64_sleeper.exe on the test VM (CRT3_SLEEPER path in
 // selftests.rs).
@@ -32,7 +32,7 @@ static VOID CALLBACK work_cb(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_
     Sleep(INFINITE);
 }
 
-int main(void)
+static int run(void)
 {
     PTP_POOL pool = CreateThreadpool(NULL);
     TP_CALLBACK_ENVIRON env;
@@ -52,4 +52,21 @@ int main(void)
         Sleep(60 * 1000);
     }
     return 0;
+}
+
+int main(void)
+{
+    return run();
+}
+
+/* Session 0 hosted runners: a CONSOLE-subsystem exe can block in CRT
+ * init waiting for a console, so main() never arms the thread pool.
+ * WinMain + /SUBSYSTEM:WINDOWS avoids that. */
+int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
+{
+    (void)inst;
+    (void)prev;
+    (void)cmd;
+    (void)show;
+    return run();
 }

@@ -239,6 +239,9 @@ unsafe fn create_sacrificial_spawn(
     // CREATE_SUSPENDED (0x4) when requested (B3 runs the child normally —
     // kernel32 + loader must initialize so bof-host's PEB walk works).
     const CREATE_SUSPENDED: u32 = 0x4;
+    // CREATE_NO_WINDOW: Session 0 console apps can stall in CRT init
+    // waiting for a console, so the sleeper never reaches CreateThreadpool.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // Absolute paths (contain `\`) go in lpApplicationName so SearchPath
     // cannot pick a different image. Bare names like notepad.exe stay
     // command-line-only (PATH search).
@@ -247,6 +250,11 @@ unsafe fn create_sacrificial_spawn(
     } else {
         core::ptr::null()
     };
+    let flags = if suspended {
+        CREATE_SUSPENDED
+    } else {
+        CREATE_NO_WINDOW
+    };
     let ok = unsafe {
         create_proc(
             app_name,
@@ -254,7 +262,7 @@ unsafe fn create_sacrificial_spawn(
             core::ptr::null_mut(), // lpProcessAttributes
             core::ptr::null_mut(), // lpThreadAttributes
             inherit,               // bInheritHandles
-            if suspended { CREATE_SUSPENDED } else { 0 },
+            flags,
             core::ptr::null_mut(), // lpEnvironment
             core::ptr::null(),     // lpCurrentDirectory
             si.as_mut_ptr(),       // lpStartupInfo
