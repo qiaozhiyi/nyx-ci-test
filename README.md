@@ -34,7 +34,7 @@
 | **Windows PIC 植入体** | 29,202 LOC `no_std` DLL;**28** Command 全派发;间接 syscall;9 通道(5 直连 + 4 ExtC2 中转);Module Stomping + ThreadlessInject + Pool Party;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner | ✅ 核心链路完整;**睡眠混淆条件接线**(见已知限制) |
 | **内核层 SDK** | BYOVD(默认 Shield VA memcpy;phys 双链:WDTKernel + ALSysIO64(钉 v2.0.8.0,CI 真机加载门);CR3 扫描+MZ 门已接线;RTCore64/iqvw64e 已因微软 blocklist 移除);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 占位偏移已离线证伪 |
 | **操作端** | Tauri 2 + React + Three.js 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出 + 「文件」Dock 页远程文件浏览器);BOF/upload 原生文件选择器;会话元数据 overlay(本地 star/alias/tag/notes + 归属分配);REST API;2s 轮询增量更新 | ✅ 可用(2026-07-17 接入全部 server 端点) |
-| **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI `go(args,alen)`,W^X 加载,Beacon API 族:`BeaconPrintf`/`BeaconOutput` + datap 解析族 + `BeaconIsAdmin`/`BeaconGetSpawnTo` + token/spawn + inject 族(`BeaconInjectProcess`/`BeaconInjectTemporaryProcess`,std `bof-runner` RW→RX;PIC `bof-host` 仍带名 Unresolved) + kernel32/ntdll externals 表) | ✅ 脚本可用 / ✅ BOF API 已扩面(PIC host inject 未接) |
+| **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI `go(args,alen)`,W^X 加载,Beacon API 族:`BeaconPrintf`/`BeaconOutput` + datap 解析族 + `BeaconIsAdmin`/`BeaconGetSpawnTo` + token/spawn + inject 族(`BeaconInjectProcess`/`BeaconInjectTemporaryProcess`,std `bof-runner` RW→RX;PIC `bof-host` 刻意带名 Unresolved,见已知限制) + kernel32/ntdll externals 表) | ✅ 脚本可用 / ✅ BOF API 已扩面(PIC host inject 为受限交付) |
 | **传输层** | 6 个 `Transport` trait impl（Malleable/DoH/Slack/LLM/MCP/SMB）+ JA3/JA4 计算 | ✅ 4 个 extc2 中继（Slack/LLM/Discord/MCP）全接 boot-time `TransportStack`；DoH 权威应答器、SMB/TCP pivot 父监听已落地（2026-08-03 接线波次） |
 
 ---
@@ -399,7 +399,7 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 
 ---
 
-## 已知限制(代码核对实情,2026-07-18)
+## 已知限制(代码核对实情,2026-08-28)
 
 | 项 | 代码实情 | 证据(file:line) |
 |---|---|---|
@@ -409,20 +409,20 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 | **TLS 指纹 emitter** | 🟡 **feature 门控(实验性)** | `impersonation` feature 下返回真实 BoringSSL(`wreq`)客户端(`fingerprint.rs:201-211`;`Cargo.toml [features]`);默认(hermetic)构建仍返 `Err(BackendUnavailable)`(`fingerprint.rs:225-229`)。未接入 server 出站链路。 |
 | **caller-spoof** | 🟡 **已实现(受限交付)** | `call_with_spoofed_return!` 宏 + 函数形式已存在(`caller_spoof.rs:464-499`);CET 探测自门:检测到 CET 时降级 `call_plain`(`caller_spoof.rs:36-41,212-229`)。 |
 | **Pool Party 注入** | 🟡 完整但默认 OFF(受限交付) | `tp.rs` 全实现(section 投递 + worker-factory 劫持 + `_TP_DIRECT` splice),仅 `NYX_POOL_PARTY_ON=1 && method=0 && pid!=0` 时触发。本次修复 `SYSTEM_HANDLE_INFORMATION_EX` 布局(count@0/stride 0x28/handle@0x10/pid@0x08)+ synthetic-buffer 测试。 |
-| **BOF 兼容面** | 🟡 **受限交付(Beacon API 已扩面)** | Beacon API 面:`BeaconPrintf`/`BeaconOutput` + `datap` 解析族 + `BeaconIsAdmin` + `BeaconGetSpawnTo` + token/spawn 族 + **inject 族**(2026-08-28:`BeaconInjectProcess`/`BeaconInjectTemporaryProcess` 在 std `bof-runner` 实装 RW→RX fail-closed,wine64 live-fire `0xC3` 进挂起 cmd.exe)。PIC `bof-host` inject 仍带名 Unresolved(牺牲子进程未映射 kernel32)。 |
+| **BOF 兼容面** | 🟡 **受限交付(Beacon API 已扩面)** | Beacon API 面:`BeaconPrintf`/`BeaconOutput` + `datap` 解析族 + `BeaconIsAdmin` + `BeaconGetSpawnTo` + token/spawn 族 + **inject 族**(2026-08-28:`BeaconInjectProcess`/`BeaconInjectTemporaryProcess` 在 std `bof-runner` 实装 RW→RX fail-closed,wine64 live-fire `0xC3` 进挂起 cmd.exe)。PIC `bof-host` inject **刻意**保持带名 Unresolved(牺牲子进程未映射 kernel32;走 ntdll `NtCreateThreadEx` 会破无写静态/PIC dumper)。这是文档化限制,不是未修 bug。 |
 | **WfpKit(内核)** | ✅ 已实装 + ARM64 VM 端到端已验(2026-08-16) | pid→image-path(OpenProcess+QueryFullProcessImageNameW)→`FwpmGetAppIdFromFileName0`→单条件 `FWPM_CONDITION_ALE_APP_ID` block(`netsec.rs`;FWPM_FILTER0 按 SDK 200B 布局);零条件 filter 不可能构造(P0-9 钉测试);动态会话(DYNAMIC flag)关会话即清 filter,`wfp-selftest` baseline→blocked→restored 真机全过无残留。**注:implant-win 中无任何 WFP 代码**(grep 零命中)。 |
 | **PatchGuard bypass** | 🟡 占位已离线证伪,真值未取 | `persistence.rs` valid_flag 置零法;2026-08-14 三个 ntkrnlmp.pdb 实证 `_KPRCB+0x190`=`LastExceptionToRip`(非指针),`prcb_pg_thread=0x190` 占位证伪(证据见 `offsets.rs` 注释);allow-list 门仍 OFF,真值需 live-kernel KPCR dump。非 Outflank Peekaboo 法(PeekabooWindow 另为出货路径)。 |
 | **EdrNeutralizer::kill** | ✅ **已实装(0d4a202)+ 测试闭环(2026-08-21)** | resolve EPROCESS → 快照+清零 Protection/SignatureLevel/SectionSignatureLevel(HVCI-safe 数据写)→ 用户态 `OpenProcess(PROCESS_TERMINATE)`+`TerminateProcess` → 失败回滚保护字节;纯 r/w 无 sound 终止原语(NULL Token/破坏 CR3 均 BSOD),语义已在注释诚实标注。2026-08-21 拆出 `kill_with` 可测试性缝 + 5 个 host mock 测试(成功保持 strip/终止失败回滚/回滚失败诚实报"ALIVE with PPL stripped"/非规范地址拒写/trait 委派)。 |
 | **WdtKernel 驱动** | ✅ phys 模式已交付 | 物理内存 r/w 真（`--wdt`：CR3 扫描 + MZ 验证 + VaKernelRw，`win/wdt.rs`）；VA `raw_rw` 按契约诚实返 `Err`（phys-only 驱动）。CI `byovd-wdt` 真机加载硬门（windows-2022 hosted）。**2026-08-21**：VaKernelRw 适配器上移 crate-root `pagewalk.rs`（host 可测，15 测试），CLI phys 臂新增 bootstrap 后 VA→PA 自检（读 ntoskrnl 基址验 MZ，失败卸载驱动 exit(3)）；ALSysIO64 同理。 |
 | **etw_deception 事件伪造** | ✅ 已装配 | `EtwDeceiver` 实现 `EtwForgeKit`,`win::assemble_tier` 装入 `KernelTier::etw_forge`(2026-08-15);`NtTraceEvent` 注入本身仍 operator 侧。 |
 | **nyx-loader 反射加载** | ✅ **已交付(真机验证)+ UDRL 收口(2026-08-28)** | Layer-2 pic-loader:映射 RW、导入后擦 PE 头、按节 Characteristics 收 RX/RW/R(W+X 塌 RX,无 RWX 稳态);`VirtualProtect` PEB-walk 失败码 3 / protect 失败码 15。`pic-loader.bin` regen 6512B。真机 E2E 探针(2026-08-02)验证的是收口前 blob;收口后需 hosted loader-probe 回归。 |
-| **implant-evasionsdk trait** | 🟡 **9/9 trait 有 live impl(受限交付,2026-08-28)** | live impl 在 `implant-evasion/src/evasion_glue.rs`：PdataGapScanner/StackSpoofKit/BlindKit/MemoryMaskKit + `LiveSyscalls`/`LiveUnhook`(opt-in,不进默认 bootstrap)/`LiveAntiDebug` + **`LiveSleepmask`**(委托 `fluctuation::sleep`;默认 `EvasionStack` 仍 Floors;生产睡眠路径仍 `kits.rs`,不双睡)。ProcessInjectKit 已迁 implant-tasks。 |
+| **implant-evasionsdk trait** | 🟡 **9/9 trait 有 live impl(受限交付,2026-08-28)** | live impl 在 `implant-evasion/src/evasion_glue.rs`：PdataGapScanner/StackSpoofKit/BlindKit/MemoryMaskKit + `LiveSyscalls`/`LiveUnhook`(opt-in,不进默认 bootstrap)/`LiveAntiDebug` + **`LiveSleepmask`**(委托 `fluctuation::sleep`)。**9/9 不是默认生产栈**：默认 `EvasionStack` 仍 Floors;生产睡眠路径仍 `kits.rs` Fluctuation,不双睡。ProcessInjectKit 已迁 implant-tasks。 |
 | **`mask_secret()`** | ✅ **已修复** | char-based `first2….last2` 掩码 + 非 ASCII 测试(`store/src/model.rs:73-82,108-119`)。 |
 | **SQLite migration** | ✅ **版本化迁移已统一(2026-08-21)** | 三个 store(CredStore v1/SessionStore v4/ImplantStore v1)均有独立 schema_version 表 + 单事务迁移 arm;启动时版本戳校验 fail-closed(戳高于当前版本报 `SchemaTooNew`,旧二进制不再静默打开新库);session_store v3/v4 arm 逐列幂等(PRAGMA table_info),可恢复单事务化之前撕裂的库;6 个新测试含半迁移恢复 + 撕裂数据保留。 |
 | **`created_by` 归因** | ✅ **已接** | `created_by: Some(op.name.clone())`(`implant_gen.rs:917`);生成端点带鉴权解析操作员(open 模式映射 Viewer 并拒绝写端点,`implant_gen.rs:988-992`)。 |
 | **fallback 链** | ✅ **已扩展(2026-08-21)** | `Https → DohDns → Dns → Tcp → SmbPipe`(`implant-net/src/channels/mod.rs` DEFAULT_FALLBACK_CHAIN);9 通道 implant 侧全部有真实 sender,Tcp/SmbPipe 未配置时 fail-fast 廉价跳过;4 个 ExtC2 刻意不入链(与 Https 同 server_host,无兜底语义)。行为变化:bake 了 tcp/smb 配置的部署在互联网通道全失败后自动切 pivot。**2026-08-21(续)**:`Config.fallback_bitmap` 运行时消费已接通——bitmap=0 保持静态链;非零按链位置过滤保持链序;链外位(5-7)忽略,仅链外位=禁用自动 failover;SetChannel 不受 bitmap 门禁。 |
 | **GUI 渲染盲点** | ✅ **已关闭(2026-08-21 核实)** | image 内联渲染(BMP/PNG magic 判定 + data URL)/channel 摘要/file 跨 drain 聚合 + eof 后 Blob 下载均在 `TaskBlock.tsx` 实装;`ProcessTable.tsx` 已不存在;`fetch_profile` 经 SettingsPage 挂载调用接通;Three.js 拓扑页 lazy chunk(主 bundle 实测 305KB)。 |
-| **Win11 25H2 真机** | 🟡 暂缓 | 需 CET 物理机(HVCI-on 矩阵已于 2026-08-16 放弃,不再是目标)。 |
+| **Win11 25H2 真机** | 🟡 **永久环境阻塞(不排期)** | CET 物理机不可得,不作为 Windows 用户态收口门禁(HVCI-on 矩阵已于 2026-08-16 放弃,不再是目标)。 |
 | **ARM64 x64 仿真(Prism)** | 🟡 仿真独有限制(2026-08-13 修复) | Win11 ARM64 的 x64 仿真层拒绝从非 ntdll 原生 stub 位点到达的间接 syscall(`0xC000026F`);已加仿真探测 + 直调 ntdll 降级(`87d8ade`),仿真下 HookChain 整体跳过/HWBP 拒武装/RSP swap 不武装(`c2525de`)——**全 evasion 入口 `nyx_entry` 仿真下已实证回家(SYSTEM 会话)**。真 x64 零行为变更。证据:`docs/testing/vm-arm64-verify-2026-08-10.md` §7 + CHANGELOG 2026-08-13。 |
 | **sessions 持久化** | ✅ 完整 | SQLite durability layer,boot 恢复,2026-07-16 实测重启同 id 复原;每帧持久化 `send_counter`/`last_recv`。 |
 
@@ -444,22 +444,22 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 | 同上 | **B3 隔离 BOF 链**:`bof_print.o` 经牺牲子进程管道回传 `BOF-PRINT-OK`;注入链探针;syscall_rt 探针 | ✅(2026-08-09) |
 | Qiling 仿真(macos runner) | selftest 导出可行性矩阵 **6/6**(含修复后的 `nyx_selftest_env`) | ✅(2026-08-09) |
 | Parallels Win11 ARM64(build 26100,Prism x64 仿真,中文系统)+ Defender ON | generate-implant → beacon 回家 → 用户层任务面全演练(shell/文件双向传输/截屏/剪贴板/keylog/portscan/BOF 内联+隔离/hashdump SAM+SYSTEM/getuid/trex) | ✅(2026-08-10,0 检出;`docs/testing/vm-arm64-verify-2026-08-10.md`) |
-| Win11 25H2 CET 物理机 | SPOOF_SWAP CET 修复缝(`#CP` handler) | 🟡 需物理机(HVCI-on 已放弃,不再是验证目标) |
+| Win11 25H2 CET 物理机 | SPOOF_SWAP CET 修复缝(`#CP` handler) | 🟡 永久环境阻塞,不排期(HVCI-on 已放弃,不再是验证目标) |
 | macOS(team server + agent-dev + GUI) | 协议循环 + 操作端 | ✅(本次审计期间实测 server 运行 + 真实 beacon 会话) |
 
 ---
 
 ## Roadmap
 
-- **睡眠混淆默认化** — `kits::sleep` 已条件接线;`LiveSleepmask` 已接 SDK seam(9/9)。待办:noevasion 模式下的安全掩码(helper-thread `.text` 掩码恢复,`mem.rs:249-253`)。
+- **睡眠混淆默认化** — `kits::sleep` 已条件接线;`LiveSleepmask` 已接 SDK seam(9/9 live impl,不是默认生产栈:默认 `EvasionStack` 仍 Floors,生产睡眠仍 `kits.rs` Fluctuation)。待办:noevasion 模式下的安全掩码(helper-thread `.text` 掩码恢复,`mem.rs:249-253`)。
 - **nyx-loader UDRL 强化** — Layer-2 真机验证(2026-08-02)+ 2026-08-28 PE 头擦除/分节权限收口。待办:分段投递(Stage0→Stage1→Stage2)、收口后 hosted loader-probe 回归。
-- **BOF API 扩面(剩余)** — token/spawn/inject(std host)已接。待办:PIC `bof-host` inject、`BeaconFormatAlloc`、spawn-to 可配置化。
+- **BOF API 扩面(剩余)** — token/spawn/inject(std host)已接。PIC `bof-host` inject **刻意**带名 Unresolved(牺牲子进程无 kernel32,见已知限制),不是未修 bug。待办:`BeaconFormatAlloc`、spawn-to 可配置化。
 - **transport/ 剩余 4 通道接线** — Slack/MCP 已接 server 中转(boot-time `TransportStack`,`extc2_relay.rs`);待办:malleable/doh_dns/llm_api/smb_pipe 接 server 路由。implant 侧保持自滚通道(no_std PIC 设计,非目标)。
 - **TLS 指纹 emitter 落地** — `impersonation` feature 已提供 BoringSSL(`wreq`)实现(`fingerprint.rs:201-211`);待办:接入 server 出站链路并在默认构建启用。
 - **PatchGuard 偏移验证** — 2026-08-14 离线 PDB 已证伪 0x190 占位(PDB 无 PG context 结构,此路本来就走不通);真值走 hosted-runner 零成本 live dump(WDT phys + `nt!KiProcessorBlock` 导出符号,windows-2022/Server-2025 两个 build),或走已实装的 Peekaboo 时序路径。
-- **caller-spoof CET 路径** — 宏已实现(`caller_spoof.rs:464-499`);待办:CET 主机上的真 spoof(IRET_FRAME/shadow-stack surgery;当前检测到 CET 时降级 `call_plain`)。
+- **caller-spoof CET 路径** — 宏已实现(`caller_spoof.rs:464-499`);CET 主机上的真 spoof 属永久环境阻塞(不排期;当前检测到 CET 时降级 `call_plain`)。
 - **GUI 会话元数据 overlay** — rename / tag / star / alias(TUI 曾有,GUI 无)。
-- **CET 物理机验证** — Win11 25H2 CET 真机 + `#CP` 修复缝(`KiControlProtectionFault` + `RtlRestoreContext`)。
+- **CET 物理机验证** — 永久环境阻塞(不排期)。Win11 25H2 CET 真机 + `#CP` 修复缝(`KiControlProtectionFault` + `RtlRestoreContext`)不作为 Windows 用户态收口门禁。
 
 ---
 

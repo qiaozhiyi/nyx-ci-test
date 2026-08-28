@@ -12,11 +12,19 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-28 Windows 用户态收口（文档口径，不编造 CI 数字）：
+
+- **探针覆盖**：Hosted Verify 与 windows-ci 控制台探针现覆盖 `nyx_selftest_vad`、threadless SAFE 前缀（`nyx_selftest_inject_threadless`）、fluctuation scratch（`nyx_selftest_fluctuation`，不翻 implant `.text`）、pool 复跑（`nyx_selftest_inject_pool`）、cfgstage 未补丁 `0x41`（未补丁模板回显首字节，不是伪造通过）。用户态收口待本波次 hosted 证据。
+- **PIC `bof-host` inject 刻意 Unresolved**：`BeaconInjectProcess`/`BeaconInjectTemporaryProcess` 保持带名 Unresolved——牺牲子进程无 kernel32；ntdll `NtCreateThreadEx` 会破无写静态/PIC dumper。std `bof-runner` 已有 RW→RX。这是文档化限制，不是未修 bug。
+- **永久环境阻塞（不排期）**：CET 物理机、HVCI-on 嵌套虚拟化、CrowdStrike/SentinelOne 企业盘、NDR 长驻流量、Defender 实时保护在 GitHub Server 2025 hosted（矩阵行保持 `env_limit=Defender 已关闭`，功能结果不是检测结果）。
+- **MDE / 第三方 EDR**：可选限时试验，不是合入门禁。
+- **下一产品轨道**：Linux implant（见 `docs/design/LINUX_IMPLANT_ENTRY.md`）。Windows 用户态 C2 受限交付收口，待本收口 hosted 证据。
+
 2026-08-28 多 agent 收口波次（leftover 合入 + BOF inject + UDRL + Sleepmask 9/9 + 内核窗 GUI + 多态 L1/L3；测试走 `qiaozhiyi/nyx-ci-test`）：
 
 - **leftover 合入**：`profiles/stealth.profile`（padding + bursty，未设 `NYX_PROFILE` 不加载）；既有进程注入 `inject_existing_stage_alloc` RW→RX（VAD R3 漏点）；HookChain stub 页不再 RWX 分配。
 - **CI**：`fls.rs` 非 selftest 构建下 `resolved` 未使用触发 `-D warnings`（nyx-ci-test standalone crate tests 红因）；现始终消费该变量。
-- **BOF inject 族**：`BeaconInjectProcess` / `BeaconInjectTemporaryProcess` 在 `bof-runner` 实装为 RW alloc → write → RX protect → `CreateRemoteThread`。protect 失败释放远程页且不建线程。`bof-host` PIC 仍带名 Unresolved（牺牲子进程未映射 kernel32）。host sequencer 单测锁顺序；wine64 live-fire `0xC3` 进挂起 `cmd.exe`。
+- **BOF inject 族**：`BeaconInjectProcess` / `BeaconInjectTemporaryProcess` 在 `bof-runner` 实装为 RW alloc → write → RX protect → `CreateRemoteThread`。protect 失败释放远程页且不建线程。`bof-host` PIC **刻意**带名 Unresolved（牺牲子进程未映射 kernel32；见上方收口条目）。host sequencer 单测锁顺序；wine64 live-fire `0xC3` 进挂起 `cmd.exe`。
 - **UDRL**：pic-loader 映射改为 RW，导入后、DllMain 前擦 DOS+NT+节表，再按 Characteristics 收口（W+X 塌成 RX，无 RWX 稳态）。`VirtualProtect` PEB-walk + djb2（`0x8B9EBDCD`），解析失败返回 3、protect 失败返回 15。`pic-loader.bin` regen 6512B、0 源重定位。
 - **SleepmaskKit 9/9**：`LiveSleepmask` 委托 `fluctuation::sleep`；默认 `EvasionStack` 仍 Floors；生产路径仍 `kits.rs`（不双睡）。
 - **内核窗 GUI**：设置页 Open/Close + 可选 PID；`send_command` 对 inject/hashdump 尽最大努力 `phase=open`（404/网络错误仍下发任务，502 出 notice 仍下发）。无 implant 信令，无发明 undo。

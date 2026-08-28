@@ -3,14 +3,16 @@ name: Windows CI
 # The main Windows gate. Runs on GitHub-hosted windows-latest (Server 2025).
 # Covers:
 #   1. Build (nightly MSVC implant DLL + operator CLI + offset-resolver)
-#   2. User-mode selftests (evasion stack) — SKIPPED on hosted runners: GitHub
-#      runners execute jobs in non-interactive Session 0 where rundll32 never
-#      reaches the selftest exports (verified 2026-08-01 via entry markers; the
-#      same exports pass on real machines — P4-P5 workflow). Kept as a HARD
-#      gate for self-hosted interactive runners. Two selftests DO run on
-#      hosted runners via the bof-isolated-probe console harness (LoadLibrary
-#      + direct export call, no rundll32): nyx_selftest_bof_isolated and the
-#      WP-A nyx_selftest_inject_fls (inject method 3) regression below.
+#   2. User-mode selftests (evasion stack) — the rundll32 suite is SKIPPED on
+#      hosted runners: GitHub runners execute jobs in non-interactive Session 0
+#      where rundll32 never reaches the selftest exports (verified 2026-08-01
+#      via entry markers; the same exports pass on real machines — P4-P5
+#      workflow). Kept as a HARD gate for self-hosted interactive runners.
+#      Console-probe hard gates DO run on hosted runners via bof-isolated-probe
+#      (LoadLibrary + direct export call, no rundll32): nyx_selftest_bof_isolated,
+#      WP-A nyx_selftest_inject_fls (inject method 3), and the 08-28 Session-0-
+#      safe exports (vad / inject_threadless / fluctuation / inject_pool /
+#      cfgstage) below.
 #   3. Live PDB offset resolution — extracts the GUID from the runner's own
 #      ntoskrnl.exe, downloads the matching PDB from the MS symbol server,
 #      and verifies the offset-resolver extracts correct EPROCESS + ETW-TI
@@ -203,13 +205,15 @@ jobs:
       # GitHub-hosted runners hang here (non-interactive Session 0 — rundll32
       # never reaches the exports; CHANGELOG v0.3.2 known limitation, verified
       # with entry markers 2026-08-01). Skip with a notice on hosted runners;
-      # the gate stays HARD on self-hosted interactive machines. Real-machine
-      # selftest coverage runs via the P4-P5 workflow.
+      # the gate stays HARD on self-hosted interactive machines. Hosted
+      # coverage of Session-0-safe exports is the B3/B4 console-probe steps
+      # plus the 08-28 vad/threadless/fluctuation/pool/cfgstage step below.
+      # Additional real-machine coverage runs via the P4-P5 workflow.
       - name: Selftest regression (evasion stack)
         shell: pwsh
         run: |
           if ($env:RUNNER_ENVIRONMENT -eq 'github-hosted') {
-            Write-Host "::notice::selftests skipped: GitHub-hosted runner is non-interactive Session 0; rundll32 never reaches the exports (known limitation v0.3.2). Real-machine coverage via P4-P5."
+            Write-Host "::notice::rundll32 selftests skipped: GitHub-hosted runner is non-interactive Session 0; rundll32 never reaches the exports (known limitation v0.3.2). Hosted coverage is B3/B4 + 08-28 console-probe steps; additional real-machine coverage via P4-P5."
             exit 0
           }
           # Build 17763 (Windows Server 2019). The implant's anti-sandbox
@@ -324,6 +328,102 @@ jobs:
           Write-Host "::notice::FLS callback-inject selftest PASS (mask=7: sacrificial + kernel32 + inject ok)"
           exit 0
 
+      # ---- 08-28 Session-0-safe console selftests (hosted-runnable) ----
+      # Same harness as B3/B4: nyx-bof-isolated-probe LoadLibrary + direct
+      # export call (no rundll32 — Session 0 never reaches rundll32 exports).
+      # Reuses the probe EXE built in the B3 step and the selftest implant DLL
+      # from the implant build step. HARD gates except inject_pool exit 9
+      # (env skip: no worker factory / OpenProcess), which is a warning.
+      #   vad / inject_threadless / fluctuation: expect 7 (0b0111)
+      #   inject_pool: 7 pass / 9 env-skip warning / 5 WARN-degrade FAIL
+      #   cfgstage: unpatched CI template first byte 0x41 (65); FAIL on
+      #             probe 0xE0/0xE1, timeout, or 0x61-0x64 (locate/decrypt/
+      #             parse/empty host).
+      - name: Hosted console selftests (vad/threadless/fluctuation/pool/cfgstage)
+        shell: pwsh
+        run: |
+          # Anti-sandbox suite may flag the hosted runner as a VM; bypass so
+          # the selftests actually execute (same as B4 / the regression step).
+          $env:NYX_SKIP_SANDBOX = "1"
+          $probe = "target\release\nyx-bof-isolated-probe.exe"
+          $dll = "crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
+          if (-not (Test-Path $probe)) { Write-Host "::error::probe exe missing"; exit 1 }
+          if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL missing"; exit 1 }
+
+          # Start-Process + explicit timeout (not `&`), same as B4. Do not wrap
+          # this in a nested function: pwsh functions do not close over caller
+          # locals (see the Live PDB step below). inject_pool waits for remote
+          # kernel32 + a 2s settle; a hung wait must not burn the job timeout.
+          $failed = @()
+          $exports = @(
+            "nyx_selftest_vad",
+            "nyx_selftest_inject_threadless",
+            "nyx_selftest_fluctuation",
+            "nyx_selftest_inject_pool",
+            "nyx_selftest_cfgstage"
+          )
+          foreach ($t in $exports) {
+            $p = Start-Process $probe -ArgumentList "`"$dll`"",$t -PassThru -WindowStyle Hidden
+            $p.WaitForExit(45000) | Out-Null
+            if (-not $p.HasExited) {
+              $p.Kill()
+              Write-Host ("{0,-32} TIMEOUT" -f $t)
+              Write-Host "::error::$t TIMEOUT (45s)"
+              $failed += "$t=TIMEOUT"
+              continue
+            }
+            $code = $p.ExitCode
+            $bits = if ($code -ge 0) { [Convert]::ToString($code, 2) } else { "neg" }
+            Write-Host ("{0} exit: {1} (0b{2} / 0x{1:X})" -f $t, $code, $bits)
+
+            if ($t -eq "nyx_selftest_inject_pool") {
+              if ($code -eq 7) {
+                Write-Host "::notice::$t PASS (mask=7: sacrificial + pool party ok)"
+              } elseif ($code -eq 9) {
+                # Env skip (no worker factory / OpenProcess) — not a product fail.
+                Write-Host "::warning::$t exit 9 (env skip: no worker factory / OpenProcess) — not failing the job"
+              } elseif ($code -eq 5) {
+                Write-Host "::error::$t exit 5 (WARN degrade to method 2) — Pool Party did not run; failing the job"
+                $failed += "$t=5"
+              } else {
+                Write-Host "::error::$t expected 7 (pass) or 9 (env skip); got $code"
+                $failed += ("{0}={1}" -f $t, $code)
+              }
+            } elseif ($t -eq "nyx_selftest_cfgstage") {
+              if ($code -eq 65) {
+                Write-Host "::notice::$t PASS (0x41 unpatched CI template)"
+              } elseif ($code -eq 0xE0) {
+                Write-Host "::error::$t LoadLibrary failed (0xE0)"
+                $failed += "$t=0xE0"
+              } elseif ($code -eq 0xE1) {
+                Write-Host "::error::$t export missing (0xE1)"
+                $failed += "$t=0xE1"
+              } elseif ($code -ge 0x61 -and $code -le 0x64) {
+                Write-Host ("::error::{0} stage fail 0x{1:X} (0x61 locate_ct / 0x62 decrypt / 0x63 parse / 0x64 empty host)" -f $t, $code)
+                $failed += ("{0}=0x{1:X}" -f $t, $code)
+              } else {
+                Write-Host ("::error::{0} expected 0x41 (65) unpatched template, got {1} (0x{1:X})" -f $t, $code)
+                $failed += ("{0}={1}" -f $t, $code)
+              }
+            } else {
+              if ($code -ne 7) {
+                Write-Host "::error::$t expected 7 (0b0111), got $code"
+                $failed += ("{0}={1}" -f $t, $code)
+              } else {
+                Write-Host ("::notice::{0} PASS (mask=7)" -f $t)
+              }
+            }
+          }
+
+          if ($failed.Count -gt 0) {
+            Write-Host ("::error::hosted console selftest failures:`n  - " + ($failed -join "`n  - "))
+            exit 1
+          }
+          Write-Host "::notice::hosted console selftests PASS (vad/threadless/fluctuation/pool/cfgstage)"
+          # pwsh steps fail on a leftover non-zero LASTEXITCODE even without
+          # throw — same trap as B3/B4 (probe expected exits are 7 / 65 / 9).
+          exit 0
+
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
       - name: "Live PDB offset resolution (host's own kernel)"
         shell: pwsh
@@ -413,10 +513,10 @@ jobs:
           retention-days: 30
 
       # ---- Defender post-mortem ----
-      # The FLS inject selftest (and the whole evasion stack) runs with
-      # Defender realtime ON. When any step fails, capture the detection log:
-      # a Defender block is a plausible root cause for an inject-selftest mask
-      # miss, and the detection name is exactly the EDR signal we want.
+      # FLS / threadless / pool inject selftests (and the rest of the evasion
+      # stack) run with Defender realtime ON. When any step fails, capture the
+      # detection log: a Defender block is a plausible root cause for an
+      # inject-selftest mask miss, and the detection name is the EDR signal.
       - name: Defender telemetry (post-mortem)
         if: failure()
         shell: pwsh

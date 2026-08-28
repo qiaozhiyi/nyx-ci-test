@@ -18,7 +18,7 @@
 | # | 字段 | 类型 | 说明 |
 |---|---|---|---|
 | 1 | `date` | YYYY-MM-DD | 实测日期 |
-| 2 | `technique` | 枚举 | Nyx 技术名：`module_stomp` / `threadless` / `pool_party` / `fls_callback` / `fluctuation` / `hwbp_blind` / `indirect_syscall`（新增技术追加枚举） |
+| 2 | `technique` | 枚举 | Nyx 技术名：`module_stomp` / `threadless` / `pool_party` / `fls_callback` / `fluctuation` / `hwbp_blind` / `indirect_syscall` / `vad`（新增技术追加枚举） |
 | 3 | `edr_name` | 字符串 | EDR/AV 名称，如 `Microsoft Defender` |
 | 4 | `edr_version` | 字符串 | EDR 版本。Defender 取 `Get-MpComputerStatus` 的 `AMProductVersion`；脚本自动采集 |
 | 5 | `delivery_context` | 枚举 | 投递上下文：`dll-sideload` / `exe` / `other`（注明） |
@@ -78,6 +78,8 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 
 目标：GitHub hosted `windows-latest`（Server 2025，原生 x64，非 Prism）。Defender 实时保护在该镜像上 **开不起来**（`Set-MpPreference` 无效），行一律 `env_limit=Defender 已关闭`——功能结果，**不是**检测结果。告警差值为 0 不得外推为“免杀”。CSV：artifact `edr-matrix-32680867069`。
 
+2026-08-28：`nyx_selftest_vad` / `nyx_selftest_inject_threadless` / `nyx_selftest_fluctuation` 已是 Session-0 安全前缀，`windows-hosted-verify.yml` 的 `edr-matrix` job 经 nyx-bof-isolated-probe 驱动（期望 0x7）。下表 08-24 五行仍是当时实测，**不**虚构新数字；threadless/fluctuation **不再**标“无 hosted 可驱导出”。完整 operator RIP 劫持 / 真 beacon `sleep` 仍需桌面 C2 会话（§5）。
+
 | 日期 | 技术 | EDR（版本） | 投递 | 样本 | 成功率 | 告警 | 环境限制 | 证据 |
 |---|---|---|---|---|---|---|---|---|
 | 2026-08-24 | module_stomp | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | [run 32680867069](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/32680867069) |
@@ -85,8 +87,9 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 | 2026-08-24 | fls_callback | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上；`fls callback inject ok` |
 | 2026-08-24 | hwbp_blind | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
 | 2026-08-24 | indirect_syscall | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
-| — | threadless | — | — | — | — | — | 无 hosted 可驱导出 | 需真 C2 会话（§5） |
-| — | fluctuation | — | — | — | — | — | 无 hosted 可驱导出 | 需真 C2 会话（§5） |
+| — | threadless | — | — | — | — | — | — | 08-28 安全前缀 `nyx_selftest_inject_threadless`（spawn+alloc/write/RX+cleanup，1 字节 `ret`，不 RIP 劫持，期望 0x7）已 hosted 可驱；完整 operator RIP 劫持仍需真 C2 会话（§5）。尚无实测数字 |
+| — | fluctuation | — | — | — | — | — | — | 08-28 安全前缀 `nyx_selftest_fluctuation`（scratch PAGE_NOACCESS→RX，不翻 implant `.text`，期望 0x7）已 hosted 可驱；operator `sleep` 全路径仍需真 C2 会话（§5）。尚无实测数字 |
+| — | vad | — | — | — | — | — | — | 08-28 `nyx_selftest_vad`（walk + image RX + scratch leftover gone，期望 0x7）已 hosted 可驱。尚无实测数字 |
 
 ### 3.1 ARM64 VM + Defender 实时保护 ON（待实测）
 
@@ -150,12 +153,15 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 | 技术 | selftest 导出 | operator 命令 | 实测要点 |
 |---|---|---|---|
 | module_stomp | `nyx_selftest_inject_armed`（真 stomp 全路径） | `inject 0 <hex> 2`；`inject <pid> <hex> 2` 走现有进程变体 | 目标进程必须 x64（仿真进程），不可注入 ARM64 原生进程 |
-| threadless | `nyx_selftest_inject_threadless`（安全前缀：牺牲进程 + alloc/write/protect-to-RX + cleanup，1 字节 `ret`，不 RIP 劫持） | `inject 0 <hex> 1` | 仅牺牲进程路径；operator 命令才跑完整 RIP 劫持 |
+| threadless | `nyx_selftest_inject_threadless`（08-28 安全前缀：牺牲进程 + alloc/write/protect-to-RX + cleanup，1 字节 `ret`，不 RIP 劫持，期望 0x7；hosted 可驱） | `inject 0 <hex> 1` | 仅牺牲进程路径；operator 命令才跑完整 RIP 劫持（需桌面 live C2，不在 hosted job 内） |
 | pool_party | `nyx_selftest_inject_pool`（导出内强制 gate ON；best-effort。0x7 成功 / 0x5 WARN 降级 method 2 = 失败 / 0x9 = 环境 skip：目标无 worker factory 或 OpenProcess 失败） | `inject <pid> <hex> 0`（需构建期 gate + pid≠0） | 响应含 `WARN: Pool Party` 前缀 = 已降级 method 2，本条应记为 pool_party 失败而非成功；0x9 记 skip 而非失败或成功 |
 | fls_callback | `nyx_selftest_inject_fls`（RUNNING notepad 牺牲进程 + 1 字节 ret 探针） | `inject <pid> <hex> 3` 或 `inject 0 <hex> 3` | 牺牲进程必须 RUNNING（suspended 无 kernel32 映射） |
-| fluctuation | `nyx_selftest_fluctuation`（scratch 页 NOACCESS→RX 往返；**不**翻转 implant `.text`） | `sleep <秒>` 后观察 beacon 存活与告警 | ARM64 仿真下降级为纯 sleep，`env_limit` 必须标 `Prism 仿真降级`。VAD 自检另见 `nyx_selftest_vad` |
+| fluctuation | `nyx_selftest_fluctuation`（08-28 安全前缀：scratch 页 NOACCESS→RX 往返；**不**翻转 implant `.text`；期望 0x7；hosted 可驱） | `sleep <秒>` 后观察 beacon 存活与告警 | ARM64 仿真下降级为纯 sleep，`env_limit` 必须标 `Prism 仿真降级`。operator `sleep` 全路径仍需真 C2 会话 |
+| vad | `nyx_selftest_vad`（08-28：walk + image RX + scratch leftover gone，期望 0x7；hosted 可驱） | —（自检，非 inject method） | Session-0 安全；经 nyx-bof-isolated-probe 驱动 |
 | hwbp_blind | `nyx_selftest_hwbp_blind`（diag 标记路径，出口码 0xFF=全过） | evasion 入口 bootstrap 自动执行（`blind_etw_hwbp` / `blind_amsi_hwbp`） | patchless，无字节补丁；对照外部 etw_patch 173 告警 |
 | indirect_syscall | `nyx_selftest_syscall_rt`（间接 trampoline 实调 NtClose） | evasion 入口下任意走 syscall 的任务 | 仿真下 gadget 路径被 Prism 拒（0xC000026F）→ 直调降级；测得的是降级路径，如实记录 |
+
+**Hosted 可驱（2026-08-28 前缀）：** `nyx_selftest_vad` / `nyx_selftest_inject_threadless` / `nyx_selftest_fluctuation` 均可由 `windows-hosted-verify.yml` 的 `edr-matrix` job 经 nyx-bof-isolated-probe 驱动（期望 0x7）。这三条是 Session-0 安全前缀，**不是** operator 全路径：threadless 不含 RIP 劫持，fluctuation 不翻转 implant `.text`。完整 RIP 劫持 / live C2 `sleep` 仍需桌面会话，不在 hosted job 范围内。
 
 **单导出触发命令**（DLL 已 `win_remote_run.sh build` 上传到 `C:\nyx` 后）：
 
@@ -168,11 +174,13 @@ ssh <vm> "rundll32 C:\nyx\nyx_implant_win.dll,nyx_selftest_inject_fls" ; echo "e
 `scripts/edr_matrix_record.sh`：在目标 Windows 机（VM 或服务器）上按"前置快照 →
 触发技术 → 后置快照"采集 `Get-MpThreatDetection` / `Get-MpThreat` 计数差值，
 按 §1.1 schema 追加一行到本地 CSV（默认 `.agents/orchestrator/edr_matrix.csv`）。
-**hosted-runner 版（2026-08-24）**：`scripts/edr_matrix_hosted.ps1` 由
+**hosted-runner 版（2026-08-24，08-28 扩展前缀）：** `scripts/edr_matrix_hosted.ps1` 由
 `.github/workflows/windows-hosted-verify.yml` 的 `edr-matrix` job 调用——runner 即
 目标机（原生 x64，无 Prism 降级），Defender 实时保护由 job 反开，触发改走
-nyx-bof-isolated-probe 控制台线束（rundll32 在 Session 0 不可用）。CSV 为 artifact
-保留 90 天；回填本文件 §3 时从最近成功 run 取数，evidence 列即 run URL。
+nyx-bof-isolated-probe 控制台线束（rundll32 在 Session 0 不可用）。08-28 起矩阵含
+`vad` / `threadless` / `fluctuation` 安全前缀（期望 0x7）；完整 RIP 劫持 / live C2
+仍需桌面。CSV 为 artifact 保留 90 天；回填本文件 §3 时从最近成功 run 取数，evidence
+列即 run URL。
 
 ```bash
 # selftest 导出驱动（自动算告警差值）：

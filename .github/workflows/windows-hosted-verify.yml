@@ -9,11 +9,14 @@ name: Hosted Verify (zero-cost wave)
 #   deviceguard-probe : which hosted image actually has VBS/HVCI on
 #                       (feeds the BYOVD HVCI-skip probe decision;
 #                       informational, never fails).
-#   edr-matrix        : WP-B first live fill — Defender realtime ON, five
+#   edr-matrix        : WP-B live fill — Defender realtime ON, eight
 #                       selftest-export techniques via the console probe
 #                       harness (windows-ci.yml B3/B4 precedent), alert delta
 #                       via Get-MpThreatDetection, one CSV row per technique
-#                       per docs/testing/edr-quant-matrix.md §1.1.
+#                       per docs/testing/edr-quant-matrix.md §1.1. threadless /
+#                       fluctuation / vad are hosted-runnable via 08-28
+#                       Session-0-safe prefixes; operator-command full RIP
+#                       hijack / live C2 still need a desktop (out of this job).
 #   sideload-runtime  : WP-H delivery chain on the real Windows loader:
 #                       app-dir host -> generated proxy DLL -> forwarded
 #                       exports + DllMain implant trigger (fixture marker).
@@ -57,10 +60,14 @@ jobs:
             Write-Host "::notice::${{ matrix.os }}: Win32_DeviceGuard unavailable: $_"
           }
 
-  # ---- WP-B: first measured matrix fill (5 hosted-runnable techniques) ----
-  # threadless / fluctuation have no hosted-runnable selftest export (they
-  # need a live C2 session, edr-quant-matrix.md §5) — those two rows stay
-  # 待实测 by design, not omission.
+  # ---- WP-B: measured matrix fill (8 hosted-runnable techniques) ----
+  # threadless / fluctuation / vad ARE hosted-runnable via
+  # nyx-bof-isolated-probe (08-28 Session-0-safe prefixes in selftests.rs:
+  # vad walk+image RX+scratch leftover gone; threadless spawn+alloc/write/RX
+  # +cleanup with 1-byte ret, NO RIP hijack; fluctuation scratch PAGE_NOACCESS
+  # then RX, never flips implant .text). Operator-command full RIP hijack /
+  # live C2 still need a desktop; that remains out of this job
+  # (edr-quant-matrix.md §5).
   edr-matrix:
     name: "EDR matrix vs Defender (native x64)"
     runs-on: windows-latest
@@ -124,22 +131,26 @@ jobs:
       # Pass masks (scripts/win_selftest_all.ps1 2026-08-24 comments +
       # selftests.rs): armed=0xF, pool=0x7 (0x5 = WARN-degraded to method 2,
       # recorded as pool_party FAILURE per edr-quant-matrix.md §5; 0x9 =
-      # env skip — no worker factory / OpenProcess, NOT a pass and NOT 0x5),
-      # fls=0x7, hwbp=0xFF, syscall_rt=0b11. Hosted runner is native x64
+      # env skip — no worker factory / OpenProcess, NOT a pass and NOT 0x5;
+      # do not add 0x9 to PassCodes), fls=0x7, hwbp=0xFF, syscall_rt=0b11,
+      # vad=0x7, threadless=0x7, fluctuation=0x7. Hosted runner is native x64
       # Server 2025 — the Prism env-skip codes (0xB/0x1D/0xC1) must NOT
       # appear here.
-      - name: Run matrix (5 techniques, alert delta each)
+      - name: Run matrix (8 techniques, alert delta each)
         shell: pwsh
         run: |
           $probe = "target\release\nyx-bof-isolated-probe.exe"
           $dll = "crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $evidence = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           $rows = @(
-            @{ T = "module_stomp";     E = "nyx_selftest_inject_armed"; P = @(0xF) },
-            @{ T = "pool_party";       E = "nyx_selftest_inject_pool";  P = @(0x7) },
-            @{ T = "fls_callback";     E = "nyx_selftest_inject_fls";   P = @(0x7) },
-            @{ T = "hwbp_blind";       E = "nyx_selftest_hwbp_blind";   P = @(0xFF) },
-            @{ T = "indirect_syscall"; E = "nyx_selftest_syscall_rt";   P = @(0x3) }
+            @{ T = "module_stomp";     E = "nyx_selftest_inject_armed";      P = @(0xF) },
+            @{ T = "pool_party";       E = "nyx_selftest_inject_pool";       P = @(0x7) },
+            @{ T = "fls_callback";     E = "nyx_selftest_inject_fls";        P = @(0x7) },
+            @{ T = "hwbp_blind";       E = "nyx_selftest_hwbp_blind";        P = @(0xFF) },
+            @{ T = "indirect_syscall"; E = "nyx_selftest_syscall_rt";        P = @(0x3) },
+            @{ T = "vad";              E = "nyx_selftest_vad";               P = @(0x7) },
+            @{ T = "threadless";       E = "nyx_selftest_inject_threadless"; P = @(0x7) },
+            @{ T = "fluctuation";      E = "nyx_selftest_fluctuation";       P = @(0x7) }
           )
           foreach ($r in $rows) {
             Write-Host "===== $($r.T) ($($r.E)) ====="
@@ -152,6 +163,47 @@ jobs:
           }
           Write-Host "===== matrix CSV ====="
           Get-Content out\edr_matrix.csv
+
+      # Fat-LTO-swallow tripwire (not generate-implant e2e). CI builds an
+      # UNPATCHED template: .nyx_cfg magic is 0x41414141 so
+      # nyx_selftest_cfgstage echoes the first byte and exits 0x41. 0x41 is
+      # PASS here. Fail: timeout, missing export (probe 0xE1), or the patched
+      # load-path errors 0x61/0x62/0x63/0x64 (locate/decrypt/parse/empty host).
+      - name: cfgstage unpatched-template tripwire
+        shell: pwsh
+        run: |
+          $env:NYX_SKIP_SANDBOX = "1"
+          $probe = "target\release\nyx-bof-isolated-probe.exe"
+          $dll = "crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
+          if (-not (Test-Path $probe)) { Write-Host "::error::probe exe missing"; exit 1 }
+          if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL missing"; exit 1 }
+          # Start-Process + timeout (not `&`): expected exit is 0x41; `&` would
+          # surface NativeCommandError / fail the step on any nonzero code.
+          $p = Start-Process $probe -ArgumentList "`"$dll`"","nyx_selftest_cfgstage" -PassThru -WindowStyle Hidden
+          $p.WaitForExit(30000) | Out-Null
+          if (-not $p.HasExited) {
+            $p.Kill()
+            Write-Host "::error::nyx_selftest_cfgstage TIMEOUT (30s)"
+            exit 1
+          }
+          $code = $p.ExitCode
+          $hex = "{0:X2}" -f $code
+          Write-Host "nyx_selftest_cfgstage exit: $code (0x$hex)"
+          if ($code -eq 0xE1) {
+            Write-Host "::error::nyx_selftest_cfgstage export missing (0xE1)"
+            exit 1
+          }
+          if ($code -eq 0x61 -or $code -eq 0x62 -or $code -eq 0x63 -or $code -eq 0x64) {
+            Write-Host "::error::nyx_selftest_cfgstage load-path error 0x$hex (0x61 locate / 0x62 decrypt / 0x63 parse / 0x64 empty host)"
+            exit 1
+          }
+          if ($code -ne 0x41) {
+            Write-Host "::error::nyx_selftest_cfgstage expected 0x41 (unpatched magic first byte), got 0x$hex"
+            exit 1
+          }
+          Write-Host "::notice::cfgstage unpatched-template PASS (0x41) — placeholder readable, not a patched load-path"
+          # Expected probe code is 0x41; reset so the step does not fail on it.
+          exit 0
 
       - name: Upload matrix artifacts
         if: always()
