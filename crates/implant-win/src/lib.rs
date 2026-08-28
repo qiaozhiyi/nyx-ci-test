@@ -45,6 +45,9 @@
 
 extern crate alloc;
 
+// L3 rdata junk keep-alive (empty when NYX_BUILD_SEED is unset).
+include!(concat!(env!("OUT_DIR"), "/poly_keep.rs"));
+
 // Core layer (WP-C crate split): these 13 modules moved to the
 // `nyx-implant-core` rlib. Re-export them (with their original cfg gates:
 // heap/fmt are compiled unconditionally, the rest are Windows-only) so every

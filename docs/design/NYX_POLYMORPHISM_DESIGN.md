@@ -1,7 +1,7 @@
 # Nyx 载荷多态生成能力 — 分层设计与路线图
 
-> **Date:** 2026-08-21
-> **Status:** L2 第一增量已交付（server 侧生成期随机化）；L1/L3/L4 为规划项
+> **Date:** 2026-08-21；L1/L3 第一增量 2026-08-28
+> **Status:** L2 已交付（server 侧生成期随机化）；L4 bursty timing 已交付；L1/L3 第一增量已交付（模板构建侧 `NYX_BUILD_SEED`：opt-level/codegen-units 轮换 + 不可执行 `.rdata` junk；**不触 fat LTO**）。可执行垃圾 / 源码重排仍为规划项。
 > **Scope:** `generate-implant` 管线产物的静态指纹多样化。不改变 implant 功能、不触碰 wire 协议与加密原语。
 > **依据:** `docs/research/frontier_gap_analysis_2026-08-21.md` §1.1（推断：无多态是与顶级形态的最大结构性差距）、§1.4（arXiv 2511.21764：8 种多态行为实测，多态行为化为有效方向）、§2 P2 行（implant_gen 结构性变异，长期项）。
 > **原则:** 变异只动"死区"与构建参数，永不动功能语义；每批变异必须可被现有测试/自检套件验证功能等价。
@@ -49,6 +49,7 @@ team server `POST /api/generate-implant`
 - **检测侧证据：** 2511.21764 中"格式头调整/加壳"类静态变异对商业 AV 检出率的压制（AV 平均仅 34%）；AutoBypass（2608.01639）的多态生成闭环。
 - **前置依赖：** 模板构建流水线参数化（`scripts/win_build.sh` + CI workflow）；`NYX_BUILD_SEED` 环境契约。
 - **风险（高亮）：** ⚠️ **2026-08-10 fat LTO 常量折叠根因**（CHANGELOG b94a158）：fat LTO 会把 `NYX_CFG_PLACEHOLDER` 的读取常量折叠，吞掉服务器对 `.nyx_cfg` 段的链接后补丁，导致生成的 implant 全部回连编译期默认 127.0.0.1。现防线是 `black_box` + `nyx_selftest_cfgstage` 诊断导出。**L1 轮换 LTO 模式/opt-level 时，每个新参数组合都必须重跑 `nyx_selftest_cfgstage` 确认补丁链路存活**——这是 L1 的硬门禁，缺它不得合入。
+- **第一增量（2026-08-28，模板构建侧）：** 可选环境变量 `NYX_BUILD_SEED`（u64，十进制或 `0x` 十六进制）。**未设置**时 `scripts/win_build.sh` 不导出任何 `CARGO_PROFILE_*`，行为与历史默认 profile 一致。**设置**后 `scripts/poly_seed.sh` 导出 `CARGO_PROFILE_RELEASE_OPT_LEVEL` ∈ {3,s,z} 与 `CARGO_PROFILE_RELEASE_CODEGEN_UNITS` ∈ {16,1}。**绝不**导出 `CARGO_PROFILE_RELEASE_LTO`（尤其禁止 fat）。映射实现于 `crates/config/src/poly.rs`（单测：两种子不同元组、seed 0 确定、非法 seed fail-closed）与 `scripts/poly_seed.sh`。每个新参数组合合入前必须过 `nyx_selftest_cfgstage`；本增量不增加全组合 CI 矩阵。`generate-implant` 仍是预编译模板补丁，不加 `cargo build`。
 
 ### L2 — 常量与配置块随机化（生成期，本轮交付）
 
@@ -72,6 +73,7 @@ team server `POST /api/generate-implant`
 - **检测侧证据：** 2511.21764 八行为中的"垃圾代码插入/控制流混淆"两项——在综合管线 ~92% 检出面前单独贡献有限。
 - **前置依赖：** L1 的种子契约先行统一；垃圾代码必须通过 PIC/no_std 约束（不能引入 std 引用、不能破坏 `build-std` 链、不能引入可被静态识别为"死代码填充"的模板化模式——模板化垃圾本身会成为新签名）。
 - **风险：** 中。垃圾代码若含可执行路径则扩大攻击面与崩溃面；若纯死代码则易被启发式标记。建议先做"垃圾数据段 + 编译期函数顺序扰动"这类不可执行变异，可执行垃圾后置。
+- **第一增量（2026-08-28，不可执行 junk）：** `NYX_BUILD_SEED` 设置时 `nyx-implant-core` `build.rs` 生成 `#[used]` 只读 `.rdata` 字节 blob（splitmix64 确定性填充，打散 0x90/0xCC，避免自成 YARA）；cdylib 经 `nyx-implant-win` keep-alive 引用以免 LTO 丢段。未设置则省略静态，默认模板保持稳定。不新增可写/可执行 PE 段。可执行垃圾与不透明谓词仍后置。
 
 ### L4 — 多态行为化（运行时，与 WP-C 联动）
 
@@ -99,9 +101,9 @@ team server `POST /api/generate-implant`
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 本轮（WP-G 第一增量） | L2：`.nyx_cfg` 尾随机化 + 随机 PE overlay（server 生成期）；本文档 | ✅ 已交付（`crates/server/src/implant_gen.rs`，单测 3 项） |
-| 下一阶段 | L1：`NYX_BUILD_SEED` 驱动模板构建参数轮换；**门禁：每个参数组合过 `nyx_selftest_cfgstage`**（防 2026-08-10 LTO 根因回归） | 规划 |
-| 后续 | L4：per-implant 时序/padding 分布随机化，与 WP-C padding/timing_baseline 联动，c2lint 加元数据检查项 | 规划（依赖 WP-C） |
-| 长期（P2 原定位） | L3：源码级重排与垃圾插入，先做不可执行变异（垃圾数据段/函数顺序），可执行垃圾单独评审 | 规划 |
+| 下一阶段 | L1：`NYX_BUILD_SEED` 驱动模板构建参数轮换；**门禁：每个参数组合过 `nyx_selftest_cfgstage`**（防 2026-08-10 LTO 根因回归） | ✅ 第一增量已交付（opt-level/codegen-units；不触 LTO；见 `crates/config/src/poly.rs` + `scripts/poly_seed.sh`） |
+| 后续 | L4：per-implant 时序/padding 分布随机化，与 WP-C padding/timing_baseline 联动，c2lint 加元数据检查项 | ✅ bursty timing 已交付；分布形态扩展仍规划 |
+| 长期（P2 原定位） | L3：源码级重排与垃圾插入，先做不可执行变异（垃圾数据段/函数顺序），可执行垃圾单独评审 | 🔄 不可执行 `.rdata` junk 已交付；可执行垃圾 / 源码重排仍规划 |
 
 ### 本轮验证（测试落点）
 

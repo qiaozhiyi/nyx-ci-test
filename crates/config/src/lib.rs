@@ -28,6 +28,8 @@
 
 extern crate alloc;
 
+pub mod poly;
+
 use alloc::vec::Vec;
 
 use chacha20poly1305::{
