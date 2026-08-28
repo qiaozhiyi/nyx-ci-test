@@ -72,10 +72,26 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 记录格式：稳定版发布前，首版矩阵（§3）中每项技术至少应有一行 `env_limit=无`
 或显式标注降级的实测记录。
 
-## 3. 首版矩阵：Nyx 技术 × Microsoft Defender（待实测）
+## 3. 首版矩阵：Nyx 技术 × Microsoft Defender
+
+### 3.0 Hosted 原生 x64（2026-08-24，`windows-hosted-verify.yml` / nyx-ci-test run 32680867069）
+
+目标：GitHub hosted `windows-latest`（Server 2025，原生 x64，非 Prism）。Defender 实时保护在该镜像上 **开不起来**（`Set-MpPreference` 无效），行一律 `env_limit=Defender 已关闭`——功能结果，**不是**检测结果。告警差值为 0 不得外推为“免杀”。CSV：artifact `edr-matrix-32680867069`。
+
+| 日期 | 技术 | EDR（版本） | 投递 | 样本 | 成功率 | 告警 | 环境限制 | 证据 |
+|---|---|---|---|---|---|---|---|---|
+| 2026-08-24 | module_stomp | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | [run 32680867069](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/32680867069) |
+| 2026-08-24 | pool_party | Microsoft Defender 4.18.26070.9 | exe | 1 | 0.0% | 0 | Defender 已关闭 | 同上；exit 0x5 WARN 降级（句柄表偏移已在后续提交修复，复跑待确认） |
+| 2026-08-24 | fls_callback | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上；`fls callback inject ok` |
+| 2026-08-24 | hwbp_blind | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
+| 2026-08-24 | indirect_syscall | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
+| — | threadless | — | — | — | — | — | 无 hosted 可驱导出 | 需真 C2 会话（§5） |
+| — | fluctuation | — | — | — | — | — | 无 hosted 可驱导出 | 需真 C2 会话（§5） |
+
+### 3.1 ARM64 VM + Defender 实时保护 ON（待实测）
 
 目标环境：ARM64 VM（Parallels Win11 24H2, build 26100）+ Defender 实时保护 ON。
-**全部为占位行，无一经过本框架实测。**
+**以下仍为占位行**（与 §3.0 不可混读：环境限制不同）。
 
 | 状态 | 技术 | EDR | 投递上下文 | 成功率 | 告警数 | 预期环境限制 |
 |---|---|---|---|---|---|---|
