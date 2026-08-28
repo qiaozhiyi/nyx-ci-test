@@ -119,12 +119,12 @@ const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 /// failure answers false (keep the refusal).
 unsafe fn target_is_x64_emulated(h: *mut c_void) -> bool {
     type IsWow64Process2 = unsafe extern "system" fn(*mut c_void, *mut u16, *mut u16) -> i32;
-    let mut resolved = false;
     let mut ok = 0i32;
     let mut process_machine: u16 = 0;
     let mut native_machine: u16 = 0;
     // kernel32!IsWow64Process2 is a forwarder to kernelbase on modern
     // Windows — try both (the is_x64_emulated_on_arm64 module loop).
+    let mut resolved = false;
     for module in [b"kernel32.dll".as_slice(), b"kernelbase.dll".as_slice()] {
         if let Some(addr) = unsafe { export_addr(module, b"IsWow64Process2") } {
             resolved = true;
@@ -135,6 +135,10 @@ unsafe fn target_is_x64_emulated(h: *mut c_void) -> bool {
             }
         }
     }
+    // `resolved` is consumed by the selftest marker below; keep it live on
+    // non-selftest builds so `-D unused-variables` (CI standalone crate tests)
+    // does not fail the library.
+    let _ = resolved;
     // g6 diagnosis (selftest builds only): the refusal decision inputs — a
     // false here keeps the Prism refusal, so record WHY (unresolved API /
     // call failed / unexpected machine values).

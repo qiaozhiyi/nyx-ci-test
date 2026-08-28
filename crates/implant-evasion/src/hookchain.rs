@@ -387,8 +387,9 @@ unsafe fn alloc_persistent_stub(bytes: &[u8]) -> usize {
     write_stub_slot(page, bytes)
 }
 
-/// Lazy-allocate the persistent stub page (VirtualAlloc RWX initially) on
-/// first use. Returns the page address, or None on failure.
+/// Lazy-allocate the persistent stub page (VirtualAlloc RX) on first use.
+/// Returns the page address, or None on failure. Writes flip the slot to
+/// RWX briefly then restore RX — the page is never allocated as RWX.
 unsafe fn alloc_stub_page() -> Option<usize> {
     let mut page = STUB_PAGE.load(core::sync::atomic::Ordering::Acquire);
     if page != 0 {
@@ -404,7 +405,7 @@ unsafe fn alloc_stub_page() -> Option<usize> {
             core::ptr::null_mut(),
             0x1000,
             0x3000,
-            0x40, /* RWX initially */
+            0x20, /* RX — write_stub_slot flips RWX for the copy */
         )
     };
     if p.is_null() {
@@ -494,7 +495,7 @@ pub unsafe fn apply() -> usize {
         return 0;
     }
     // Reset the stub arena for each apply() call so the page is allocated
-    // fresh (RWX).  Reusing an already-locked-down (RX) page from a prior
+    // fresh (RX).  Reusing an already-locked-down (RX) page from a prior
     // apply() causes an AV when alloc_persistent_stub writes to it — the
     // VirtualProtect inside alloc_persistent_stub may race or fail, and the
     // copy is outside the VP guard.  A fresh page per apply() is simpler and

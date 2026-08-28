@@ -16,6 +16,10 @@ this file and the code disagree, the code wins.
 
 - **`profiles/stealth.profile`**：checked-in 操作员模板，含 `sleeptime`/`jitter`、`padding_min/max`（64–512，≤4096）、`timing_baseline "bursty"`、可 invert 的 http-post `base64; print;` 信封、真实浏览器 UA 池（默认 Chrome/131，非 `Mozilla/4.0 Nyx`）。`c2lint` 0 Error / 0 Warning。`NYX_PROFILE=profiles/stealth.profile` 同时给 server 与 agent-dev；**未设 env 不自动加载**（默认 `padding_max==0` wire 不变）。`nyx-profile` 测试 `lint(parse(stealth.profile))` 无 Error 且 envelope invert。
 
+2026-08-28 既有进程注入 RW→RX（method 2 + pid≠0，VAD R3 漏点）：
+
+- **`inject_existing_stage_alloc`**：`NtAllocateVirtualMemory` 改为 `stealth::payload_alloc_protect()`（0x04 RW），写完后 `nt_protect_virtual_memory_process` → `stealth::desired_final_protect()`（0x20 RX）。protect 失败关句柄并 Err，不以 RWX 稳态 `CreateRemoteThread`。HookChain stub 页 `VirtualAlloc` 由 0x40 改为 0x20（写窗口仍短暂 RWX→还原 RX；`lockdown_stub_page` 收 RX）。stomp 的 IMAGE `.text` RX→RWX→RX 窗口保留。
+
 2026-08-28 implant 内存/注入 stealth（VAD R1–R3 + Pool Party 0x5）：
 
 - **R3 RWX→RX**：`threadless_inject_alloc` 与 Pool Party stub/section 视图改为 alloc/map RW → 写 → `NtProtectVirtualMemory` / 目标视图 `PAGE_EXECUTE_READ`（0x20）。protect 失败则 Err，不以 RWX 为稳态。FLS 路径未改。
