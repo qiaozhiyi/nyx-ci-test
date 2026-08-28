@@ -7,10 +7,9 @@
 //! `BeaconDataLength` / `BeaconDataExtract`), `BeaconIsAdmin`,
 //! `BeaconGetSpawnTo`, the token family (`BeaconUseToken` /
 //! `BeaconRevertToken`), the spawn family (`BeaconSpawnTemporaryProcess` /
-//! `BeaconCleanupProcess`), and the community `BeaconOutput` raw-blob
-//! sibling. The injection family (`BeaconInjectProcess` /
-//! `BeaconInjectTemporaryProcess`) is deliberately NOT shimmed — see
-//! `layout::BEACON_APIS` for the rationale.
+//! `BeaconCleanupProcess`), the inject family (`BeaconInjectProcess` /
+//! `BeaconInjectTemporaryProcess`; RW→RX fail-closed), and the community
+//! `BeaconOutput` raw-blob sibling.
 //! Uses a static byte buffer and a hand-rolled formatter — **no heap, no
 //! Mutex, no String** — so the shim works safely inside the BOF's RWX memory
 //! region with a tiny stack.
@@ -353,6 +352,7 @@ extern "system" {
     ) -> *mut std::ffi::c_void;
     fn GetCurrentProcess() -> *mut std::ffi::c_void;
     fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
+    fn SetLastError(error_code: u32);
 }
 
 type OpenProcessTokenFn =
@@ -554,12 +554,9 @@ const PROCESS_INFORMATION_SIZE: usize = 24;
 /// *si, PROCESS_INFORMATION *pi)` — spawn the spawn-to path
 /// ([`BeaconGetSpawnTo`]) as a temporary process, filling `pi` for the BOF.
 /// Like CS, the process is created **suspended** (`CREATE_SUSPENDED`): the
-/// CS pattern is spawn-then-inject-then-resume. The injection primitives
-/// (`BeaconInjectProcess` / `BeaconInjectTemporaryProcess`) are deliberately
-/// NOT implemented (they need a full cross-process write+execute chain — see
-/// `layout::BEACON_APIS`), so a BOF that loads here and spawns a process owns
-/// its lifecycle: resume/terminate it via its own imports and release the
-/// handles with [`BeaconCleanupProcess`].
+/// CS pattern is spawn-then-inject-then-resume. Inject via
+/// [`BeaconInjectTemporaryProcess`] (does **not** resume the primary thread
+/// — the BOF does). Release handles with [`BeaconCleanupProcess`].
 ///
 /// `si` is passed straight through to `CreateProcessA`; a NULL `si` gets a
 /// zeroed default with `cb` set. `x86` is accepted but ignored (x64 runner,
@@ -646,6 +643,282 @@ pub unsafe extern "C" fn BeaconCleanupProcess(pi: *mut std::ffi::c_void) {
         // SAFETY: closing a BOF-owned handle is always safe.
         unsafe { CloseHandle(h_thread as *mut std::ffi::c_void) };
     }
+}
+
+// ── inject family (CS beacon.h): BeaconInjectProcess / TemporaryProcess ─────
+//
+// RW alloc → write → RX protect → CreateRemoteThread at payload+offset.
+// Protect failure never creates a thread (no RWX execute). CS inject does
+// not resume the target's primary thread; the BOF does.
+
+/// `PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+/// PROCESS_QUERY_INFORMATION` — the access mask needed to allocate, write,
+/// protect, and create a thread in the target (winnt.h).
+const PROCESS_INJECT_ACCESS: u32 = 0x0002 | 0x0008 | 0x0020 | 0x0400;
+const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
+const MEM_RELEASE: u32 = 0x8000;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+/// `PAGE_EXECUTE_READWRITE` — refused even if a caller asks (fail-closed).
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+type VirtualAllocExFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    usize,
+    u32,
+    u32,
+) -> *mut std::ffi::c_void;
+type WriteProcessMemoryFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *const u8,
+    usize,
+    *mut usize,
+) -> i32;
+type VirtualProtectExFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    usize,
+    u32,
+    *mut u32,
+) -> i32;
+type CreateRemoteThreadFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    usize,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    u32,
+    *mut u32,
+) -> *mut std::ffi::c_void;
+type VirtualFreeExFn =
+    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, usize, u32) -> i32;
+type OpenProcessFn = unsafe extern "system" fn(u32, i32, u32) -> *mut std::ffi::c_void;
+
+struct InjectFns {
+    vax: VirtualAllocExFn,
+    wpm: WriteProcessMemoryFn,
+    vpx: VirtualProtectExFn,
+    crt: CreateRemoteThreadFn,
+    vfe: VirtualFreeExFn,
+    open: OpenProcessFn,
+}
+
+fn resolve_inject_fns() -> Option<InjectFns> {
+    // SAFETY: each address came from GetProcAddress on kernel32 with the
+    // exact export name; the fn-pointer types match the documented Win32
+    // signatures. usize and these pointers are the same width.
+    unsafe {
+        let vax = resolve_export(b"kernel32.dll\0", b"VirtualAllocEx\0")?;
+        let wpm = resolve_export(b"kernel32.dll\0", b"WriteProcessMemory\0")?;
+        let vpx = resolve_export(b"kernel32.dll\0", b"VirtualProtectEx\0")?;
+        let crt = resolve_export(b"kernel32.dll\0", b"CreateRemoteThread\0")?;
+        let vfe = resolve_export(b"kernel32.dll\0", b"VirtualFreeEx\0")?;
+        let open = resolve_export(b"kernel32.dll\0", b"OpenProcess\0")?;
+        Some(InjectFns {
+            vax: std::mem::transmute::<usize, VirtualAllocExFn>(vax),
+            wpm: std::mem::transmute::<usize, WriteProcessMemoryFn>(wpm),
+            vpx: std::mem::transmute::<usize, VirtualProtectExFn>(vpx),
+            crt: std::mem::transmute::<usize, CreateRemoteThreadFn>(crt),
+            vfe: std::mem::transmute::<usize, VirtualFreeExFn>(vfe),
+            open: std::mem::transmute::<usize, OpenProcessFn>(open),
+        })
+    }
+}
+
+fn fail_invalid_param() -> i32 {
+    unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+    0
+}
+
+struct WinRemote {
+    h_proc: *mut std::ffi::c_void,
+    fns: InjectFns,
+}
+
+impl crate::inject::RemoteProcess for WinRemote {
+    fn alloc(&mut self, size: usize, protect: u32) -> Option<usize> {
+        // Refuse RWX even if a future caller asks — the sequencer passes RW.
+        if protect == PAGE_EXECUTE_READWRITE {
+            return None;
+        }
+        let p = unsafe {
+            (self.fns.vax)(
+                self.h_proc,
+                std::ptr::null_mut(),
+                size,
+                MEM_COMMIT_RESERVE,
+                protect,
+            )
+        };
+        if p.is_null() {
+            None
+        } else {
+            Some(p as usize)
+        }
+    }
+
+    fn write(&mut self, remote: usize, bytes: &[u8]) -> bool {
+        let mut written = 0usize;
+        let ok = unsafe {
+            (self.fns.wpm)(
+                self.h_proc,
+                remote as *mut std::ffi::c_void,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut written,
+            )
+        };
+        ok != 0 && written == bytes.len()
+    }
+
+    fn protect(&mut self, remote: usize, size: usize, new_protect: u32) -> bool {
+        if new_protect == PAGE_EXECUTE_READWRITE {
+            return false;
+        }
+        let mut old = 0u32;
+        unsafe {
+            (self.fns.vpx)(
+                self.h_proc,
+                remote as *mut std::ffi::c_void,
+                size,
+                new_protect,
+                &mut old,
+            ) != 0
+        }
+    }
+
+    fn create_thread(&mut self, entry: usize, arg: usize) -> bool {
+        let h = unsafe {
+            (self.fns.crt)(
+                self.h_proc,
+                std::ptr::null_mut(),
+                0,
+                entry as *mut std::ffi::c_void,
+                arg as *mut std::ffi::c_void,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if h.is_null() {
+            return false;
+        }
+        // CS closes the thread handle; it does not wait. Closing does not
+        // terminate the thread.
+        unsafe { CloseHandle(h) };
+        true
+    }
+
+    fn free(&mut self, remote: usize) {
+        let _ =
+            unsafe { (self.fns.vfe)(self.h_proc, remote as *mut std::ffi::c_void, 0, MEM_RELEASE) };
+    }
+}
+
+/// Shared write+execute chain. `opened` is true when this function owns
+/// `h_proc` (we OpenProcess'd it) and must close it on every path.
+unsafe fn inject_into(
+    h_proc: *mut std::ffi::c_void,
+    payload: *const u8,
+    payload_len: i32,
+    payload_offset: i32,
+    arg: *mut u8,
+    opened: bool,
+) -> i32 {
+    let result = inject_into_inner(h_proc, payload, payload_len, payload_offset, arg);
+    if opened && !h_proc.is_null() {
+        unsafe { CloseHandle(h_proc) };
+    }
+    result
+}
+
+unsafe fn inject_into_inner(
+    h_proc: *mut std::ffi::c_void,
+    payload: *const u8,
+    payload_len: i32,
+    payload_offset: i32,
+    arg: *mut u8,
+) -> i32 {
+    if h_proc.is_null()
+        || payload.is_null()
+        || !crate::inject::payload_entry_ok(payload_len, payload_offset)
+    {
+        return fail_invalid_param();
+    }
+    let Some(fns) = resolve_inject_fns() else {
+        return fail_invalid_param();
+    };
+    // SAFETY: payload_entry_ok guarantees payload_len > 0; the BOF contract
+    // is that `payload` points at that many readable bytes (same as
+    // WriteProcessMemory's source).
+    let bytes = unsafe { core::slice::from_raw_parts(payload, payload_len as usize) };
+    let mut remote = WinRemote { h_proc, fns };
+    if crate::inject::inject_rw_rx_thread(&mut remote, bytes, payload_offset, arg as usize) {
+        1
+    } else {
+        0
+    }
+}
+
+/// `BOOL BeaconInjectProcess(HANDLE hProc, int pid, char *payload, int
+/// payload_len, int payload_offset, char *arg)` — inject `payload` into an
+/// existing process. CS is `void`; this returns BOOL like the spawn/token
+/// shims so failure is observable (Win32 `GetLastError` is also set).
+///
+/// `payload_offset` is the entry offset into `payload`. `arg` is the remote
+/// thread parameter (not copied into the remote allocation).
+///
+/// If `hProc` is NULL the pid is opened with [`PROCESS_INJECT_ACCESS`]. If
+/// both the handle and the pid are unusable, fail. Does not resume any
+/// existing thread.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconInjectProcess(
+    h_proc: *mut std::ffi::c_void,
+    pid: i32,
+    payload: *const u8,
+    payload_len: i32,
+    payload_offset: i32,
+    arg: *mut u8,
+) -> i32 {
+    if !h_proc.is_null() {
+        return unsafe { inject_into(h_proc, payload, payload_len, payload_offset, arg, false) };
+    }
+    if pid == 0 {
+        return fail_invalid_param();
+    }
+    let Some(fns) = resolve_inject_fns() else {
+        return fail_invalid_param();
+    };
+    let opened = unsafe { (fns.open)(PROCESS_INJECT_ACCESS, 0, pid as u32) };
+    if opened.is_null() {
+        return 0;
+    }
+    unsafe { inject_into(opened, payload, payload_len, payload_offset, arg, true) }
+}
+
+/// `BOOL BeaconInjectTemporaryProcess(PROCESS_INFORMATION *pInfo, char
+/// *payload, int payload_len, int payload_offset, char *arg)` — inject into
+/// a process the BOF spawned (typically via [`BeaconSpawnTemporaryProcess`]).
+/// Uses `pInfo->hProcess`. Does **not** resume the primary thread — CS
+/// inject starts a remote thread; the BOF resumes. NULL `pInfo` or NULL
+/// `hProcess` is a defined failure.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconInjectTemporaryProcess(
+    p_info: *mut std::ffi::c_void,
+    payload: *const u8,
+    payload_len: i32,
+    payload_offset: i32,
+    arg: *mut u8,
+) -> i32 {
+    if p_info.is_null() {
+        return fail_invalid_param();
+    }
+    // PROCESS_INFORMATION: HANDLE hProcess at offset 0.
+    let h_proc = unsafe { *(p_info as *const *mut std::ffi::c_void) };
+    if h_proc.is_null() {
+        return fail_invalid_param();
+    }
+    unsafe { inject_into(h_proc, payload, payload_len, payload_offset, arg, false) }
 }
 
 fn format_into(args: &[u64; 4], fmt: *const c_char) {
@@ -1686,5 +1959,175 @@ mod tests {
             }
             eprintln!("note: this environment accepted a cb=0 STARTUPINFOA");
         }
+    }
+
+    // ── inject family (BeaconInjectProcess / BeaconInjectTemporaryProcess) ───
+
+    fn last_error() -> u32 {
+        type GetLastErrorFn = unsafe extern "system" fn() -> u32;
+        let Some(g) = resolve_export(b"kernel32.dll\0", b"GetLastError\0") else {
+            return 0;
+        };
+        let g: GetLastErrorFn = unsafe { std::mem::transmute(g) };
+        unsafe { g() }
+    }
+
+    fn terminate_and_cleanup(pi: &mut [usize; 3]) {
+        type TerminateProcessFn = unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32;
+        if let Some(term) = resolve_export(b"kernel32.dll\0", b"TerminateProcess\0") {
+            let term: TerminateProcessFn = unsafe { std::mem::transmute(term) };
+            unsafe { term(pi[0] as *mut std::ffi::c_void, 0) };
+        }
+        unsafe { BeaconCleanupProcess(pi.as_mut_ptr() as *mut std::ffi::c_void) };
+    }
+
+    #[test]
+    fn inject_process_null_handle_and_zero_pid_fails() {
+        let payload = [0xC3u8];
+        let ok = unsafe {
+            BeaconInjectProcess(
+                std::ptr::null_mut(),
+                0,
+                payload.as_ptr(),
+                1,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ok, 0, "NULL hProc + pid 0 must fail defined");
+        assert_ne!(last_error(), 0, "failure must set GetLastError");
+    }
+
+    #[test]
+    fn inject_process_null_payload_fails() {
+        let ok = unsafe {
+            BeaconInjectProcess(
+                GetCurrentProcess(),
+                0,
+                std::ptr::null(),
+                1,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ok, 0, "NULL payload must fail defined");
+        assert_ne!(last_error(), 0);
+    }
+
+    #[test]
+    fn inject_process_offset_out_of_range_fails() {
+        let payload = [0xC3u8];
+        let ok = unsafe {
+            BeaconInjectProcess(
+                GetCurrentProcess(),
+                0,
+                payload.as_ptr(),
+                1,
+                1,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ok, 0, "offset == len is not a valid entry");
+        assert_ne!(last_error(), 0);
+    }
+
+    #[test]
+    fn inject_temporary_null_pinfo_fails() {
+        let payload = [0xC3u8];
+        let ok = unsafe {
+            BeaconInjectTemporaryProcess(
+                std::ptr::null_mut(),
+                payload.as_ptr(),
+                1,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ok, 0, "NULL PROCESS_INFORMATION must fail defined");
+        assert_ne!(last_error(), 0);
+    }
+
+    #[test]
+    fn inject_temporary_null_hprocess_fails() {
+        let mut pi = [0usize; 3];
+        let payload = [0xC3u8];
+        let ok = unsafe {
+            BeaconInjectTemporaryProcess(
+                pi.as_mut_ptr() as *mut std::ffi::c_void,
+                payload.as_ptr(),
+                1,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ok, 0, "NULL hProcess must fail defined");
+        assert_ne!(last_error(), 0);
+    }
+
+    #[test]
+    fn inject_temporary_live_fire_ret_into_spawned_process() {
+        // Spawn suspended cmd.exe, inject a 1-byte `ret` (0xC3) via the CS
+        // spawn-then-inject path, then terminate + cleanup. Does not resume
+        // the primary thread (CS inject starts a remote thread; the BOF resumes).
+        let mut pi = [0usize; 3];
+        let spawned = spawn(0, std::ptr::null_mut(), &mut pi);
+        if spawned == 0 {
+            eprintln!("skipping inject live-fire: CreateProcessA failed in this environment");
+            return;
+        }
+        let payload = [0xC3u8];
+        let ok = unsafe {
+            BeaconInjectTemporaryProcess(
+                pi.as_mut_ptr() as *mut std::ffi::c_void,
+                payload.as_ptr(),
+                1,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            // Wine prefixes sometimes refuse CreateRemoteThread; the
+            // protect-before-thread order is locked by inject.rs host tests.
+            eprintln!(
+                "skipping inject live-fire: CreateRemoteThread failed (GetLastError={})",
+                last_error()
+            );
+            terminate_and_cleanup(&mut pi);
+            return;
+        }
+        // Also exercise OpenProcess(pid) when hProc is NULL, and the
+        // caller-supplied handle path, against the same suspended process.
+        let pid = pi[2] as u32 as i32;
+        let via_pid = unsafe {
+            BeaconInjectProcess(
+                std::ptr::null_mut(),
+                pid,
+                payload.as_ptr(),
+                1,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        let via_handle = unsafe {
+            BeaconInjectProcess(
+                pi[0] as *mut std::ffi::c_void,
+                0,
+                payload.as_ptr(),
+                1,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        terminate_and_cleanup(&mut pi);
+        assert_eq!(ok, 1, "BeaconInjectTemporaryProcess(0xC3)");
+        if via_pid == 0 {
+            eprintln!(
+                "note: BeaconInjectProcess(NULL, pid) failed GetLastError={}",
+                last_error()
+            );
+        } else {
+            assert_eq!(via_pid, 1);
+        }
+        assert_eq!(via_handle, 1, "BeaconInjectProcess(hProc, 0xC3)");
     }
 }

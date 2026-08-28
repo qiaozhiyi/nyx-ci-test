@@ -10,7 +10,8 @@
 //! Externals are resolved from the Beacon-API shims (`BeaconPrintf`, the
 //! `datap` parser family, `BeaconIsAdmin`, `BeaconGetSpawnTo`, the token
 //! family (`BeaconUseToken`/`BeaconRevertToken`), the spawn family
-//! (`BeaconSpawnTemporaryProcess`/`BeaconCleanupProcess`), `BeaconOutput`)
+//! (`BeaconSpawnTemporaryProcess`/`BeaconCleanupProcess`), the inject family
+//! (`BeaconInjectProcess`/`BeaconInjectTemporaryProcess`), `BeaconOutput`)
 //! plus a table of common kernel32/ntdll/CRT exports (`GetModuleHandleA/W`,
 //! `GetProcAddress`, `VirtualAlloc`, `VirtualProtect`, `VirtualFree`,
 //! `LoadLibraryA`, `GetLastError`, the memcpy family, …) fetched at load time
@@ -426,6 +427,8 @@ fn beacon_shim_addr(name: &str) -> Option<u64> {
         "BeaconRevertToken" => addr_of(BeaconRevertToken as *const ()),
         "BeaconSpawnTemporaryProcess" => addr_of(BeaconSpawnTemporaryProcess as *const ()),
         "BeaconCleanupProcess" => addr_of(BeaconCleanupProcess as *const ()),
+        "BeaconInjectProcess" => addr_of(BeaconInjectProcess as *const ()),
+        "BeaconInjectTemporaryProcess" => addr_of(BeaconInjectTemporaryProcess as *const ()),
         _ => return None,
     };
     Some(addr)

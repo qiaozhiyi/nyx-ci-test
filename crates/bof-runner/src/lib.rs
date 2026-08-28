@@ -25,7 +25,9 @@
 //! Besides the Beacon-API shims (`BeaconPrintf`, the `datap` argument-parser
 //! family, `BeaconIsAdmin`, `BeaconGetSpawnTo`, the token family
 //! (`BeaconUseToken`/`BeaconRevertToken`), the spawn family
-//! (`BeaconSpawnTemporaryProcess`/`BeaconCleanupProcess`), `BeaconOutput` —
+//! (`BeaconSpawnTemporaryProcess`/`BeaconCleanupProcess`), the inject family
+//! (`BeaconInjectProcess`/`BeaconInjectTemporaryProcess`; std Windows host
+//! only — PIC `bof-host` keeps them named-Unresolved), `BeaconOutput` —
 //! see `layout::BEACON_APIS`), the loader resolves a table of common
 //! kernel32/ntdll exports (`GetModuleHandleA/W`, `GetProcAddress`,
 //! `VirtualAlloc`, `VirtualProtect`, `VirtualFree`, `LoadLibraryA`,
@@ -44,6 +46,8 @@
 // Windows PE-layout helpers: constants + pure math consumed by `win`.
 // Compiled on all platforms so the host-side unit tests below still run in
 // macOS/Linux CI; the helpers are dead code outside Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod inject;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod layout;
 #[cfg(target_os = "windows")]

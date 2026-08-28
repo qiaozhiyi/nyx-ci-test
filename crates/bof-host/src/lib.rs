@@ -33,11 +33,15 @@
 //!     entry stashed in the TEB `ArbitraryUserPointer` slot (gs:[0x28]; the
 //!     `args_len` u32 sits immediately before the args bytes);
 //!   - `BeaconGetSpawnTo` returns a READ-ONLY `.rdata` string (no writable
-//!     scratch buffer), and `BeaconSpawnTemporaryProcess` is deliberately NOT
-//!     in the shim table — process creation needs kernel32 `CreateProcess`,
-//!     which is never mapped in the sacrificial child — so a BOF referencing
-//!     it fails load with a loud "unresolved external" (isolated mode is
-//!     a受限交付 subset; inline execution keeps the full shim set).
+//!     scratch buffer), and `BeaconSpawnTemporaryProcess` /
+//!     `BeaconInjectProcess` / `BeaconInjectTemporaryProcess` are
+//!     deliberately NOT in the shim table — process creation and the
+//!     cross-process RW→RX inject chain need kernel32 (`CreateProcess`,
+//!     `VirtualAllocEx`, `CreateRemoteThread`), which is never mapped in the
+//!     sacrificial child. Those APIs are implemented in std `bof-runner`;
+//!     the PIC host keeps them named-Unresolved so a BOF referencing them
+//!     fails load loudly (isolated mode is a受限交付 subset; inline
+//!     execution keeps the full shim set).
 //! - **NO static tables holding pointers** (they would emit base relocations
 //!   the raw blob cannot fix up): the shim table is a `match` on the external
 //!   name, exactly like `bof.rs::beacon_api_addr`.

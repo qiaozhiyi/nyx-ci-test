@@ -72,16 +72,13 @@ pub fn tramp_stub_offset(index: usize) -> usize {
 /// surface: `BeaconPrintf` plus the `datap` argument parser, `BeaconIsAdmin`,
 /// `BeaconGetSpawnTo`, the token family (`BeaconUseToken` /
 /// `BeaconRevertToken`), the spawn family (`BeaconSpawnTemporaryProcess` /
-/// `BeaconCleanupProcess`), and the community `BeaconOutput` extension. Each
-/// name appears exactly once (enforced by a test).
+/// `BeaconCleanupProcess`), the inject family (`BeaconInjectProcess` /
+/// `BeaconInjectTemporaryProcess`), and the community `BeaconOutput`
+/// extension. Each name appears exactly once (enforced by a test).
 ///
-/// Deliberately NOT here: the injection family (`BeaconInjectProcess`,
-/// `BeaconInjectTemporaryProcess`). A truthful implementation needs a full
-/// cross-process injection chain (allocate + write + execute in the target),
-/// which is a post-ex primitive of its own, not a shim; a stub that pretends
-/// to inject would silently break BOFs. BOFs referencing them fail load with
-/// a loud, NAMED `Unresolved` error (the loader reports the symbol name), so
-/// the limitation is visible instead of silent.
+/// The inject family is implemented in the std Windows host (`shim.rs`) as
+/// a real RW→RX write+execute chain. The PIC `bof-host` keeps the same
+/// names **unresolved** (kernel32 is not mapped in the sacrificial child).
 pub const BEACON_APIS: &[&str] = &[
     "BeaconPrintf",
     "BeaconOutput",
@@ -96,6 +93,8 @@ pub const BEACON_APIS: &[&str] = &[
     "BeaconRevertToken",
     "BeaconSpawnTemporaryProcess",
     "BeaconCleanupProcess",
+    "BeaconInjectProcess",
+    "BeaconInjectTemporaryProcess",
 ];
 
 /// kernel32/ntdll exports resolved at load time via `GetModuleHandleA` +
@@ -150,6 +149,11 @@ pub const EXTERN_SINGLES: &[(&str, &str)] = &[
     ("kernel32.dll", "ExitProcess"),
     ("kernel32.dll", "TerminateProcess"),
     ("kernel32.dll", "OpenProcess"),
+    ("kernel32.dll", "VirtualAllocEx"),
+    ("kernel32.dll", "VirtualProtectEx"),
+    ("kernel32.dll", "VirtualFreeEx"),
+    ("kernel32.dll", "WriteProcessMemory"),
+    ("kernel32.dll", "CreateRemoteThread"),
     ("ntdll.dll", "RtlMoveMemory"),
     ("ntdll.dll", "RtlZeroMemory"),
     ("ntdll.dll", "RtlFillMemory"),
@@ -262,5 +266,14 @@ mod tests {
             assert!(!EXTERN_SINGLES.iter().any(|(_, e)| *e == n));
             assert!(!CRT_NAMES.contains(&n));
         }
+    }
+
+    #[test]
+    fn inject_family_is_registered() {
+        // A missing name would load-fail community BOFs with a loud
+        // Unresolved — the previous deliberate omission. Both names must
+        // sit in the table (and therefore in win.rs::beacon_shim_addr).
+        assert!(BEACON_APIS.contains(&"BeaconInjectProcess"));
+        assert!(BEACON_APIS.contains(&"BeaconInjectTemporaryProcess"));
     }
 }
