@@ -1536,9 +1536,9 @@ const CRT3_SLEEPER: &str = "C:\\nyx_test\\nyx_x64_sleeper.exe";
 #[cfg(feature = "selftest")]
 fn sleeper_on_disk() -> bool {
     type GetFileAttributesW = unsafe extern "system" fn(*const u16) -> u32;
-    let Some(addr) =
-        unsafe { nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"GetFileAttributesW") }
-    else {
+    let addr =
+        unsafe { nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"GetFileAttributesW") };
+    let Some(addr) = addr else {
         return false;
     };
     let get: GetFileAttributesW = unsafe { core::mem::transmute(addr) };
