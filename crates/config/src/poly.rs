@@ -209,8 +209,10 @@ fn scrub_nop_int3(b: u8) -> u8 {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    #[cfg(unix)]
     use std::process::Command;
 
+    #[cfg(unix)]
     fn poly_seed_sh() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/poly_seed.sh")
     }
