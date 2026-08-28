@@ -666,9 +666,14 @@ pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
 /// `BeaconSpawnTemporaryProcess` is deliberately NOT in this table — process
 /// creation needs CreateProcess (kernel32, never mapped in the sacrificial
 /// child), and an ntdll-only NtCreateUserProcess chain is too fragile for
-/// the PIC blob; a BOF referencing it fails load with a loud, NAMED
-/// "unresolved external" instead of a silent stub. Every other shim matches
-/// the inline semantics.
+/// the PIC blob. The inject family (`BeaconInjectProcess` /
+/// `BeaconInjectTemporaryProcess`) is implemented in std `bof-runner`; the
+/// PIC host keeps them named-Unresolved — a truthful RW→RX remote
+/// write+execute chain needs kernel32 `VirtualAllocEx`/`CreateRemoteThread`
+/// (not mapped here), and an ntdll-only `NtCreateThreadEx` path would
+/// violate the no-write-static / PIC dumper constraints. A BOF referencing
+/// either fails load with a loud, NAMED "unresolved external" instead of a
+/// silent stub. Every other shim matches the inline semantics.
 pub fn beacon_api_addr(name: &str) -> Option<u64> {
     /// fn-item → u64 address (see bof.rs for the coercion trick).
     fn addr_of(f: *const ()) -> u64 {
