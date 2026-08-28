@@ -337,6 +337,11 @@ mod tests {
         assert!(l3_junk_rust_source_from_seed_var(Some("")).is_err());
     }
 
+    // `poly_seed.sh` is a Unix template-build helper (`win_build.sh` on the
+    // macOS/Linux cross host). Windows CI has no `python3` on PATH for Git
+    // bash, so these two tests are unix-only; the rust mapper is still
+    // covered on every host by the other poly tests.
+    #[cfg(unix)]
     #[test]
     fn poly_seed_sh_matches_rust_mapper() {
         let script = poly_seed_sh();
@@ -359,6 +364,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn poly_seed_sh_invalid_is_fail_closed() {
         let script = poly_seed_sh();
