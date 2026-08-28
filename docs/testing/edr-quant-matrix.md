@@ -78,12 +78,12 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 
 目标：GitHub hosted `windows-latest`（Server 2025，原生 x64，非 Prism）。Defender 实时保护在该镜像上 **开不起来**（`Set-MpPreference` 无效），行一律 `env_limit=Defender 已关闭`——功能结果，**不是**检测结果。告警差值为 0 不得外推为“免杀”。CSV：artifact `edr-matrix-32680867069`。
 
-2026-08-28 closeout（`windows-closeout` / nyx-ci-test run [33135025777](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135025777)）：同一 job 扩到 8 行。vad / threadless 安全前缀 / fluctuation scratch 均为 100%、0 告警。pool_party 仍 0.0%（WARN 降级 method 2；Windows CI 同镜像上 `nyx_selftest_inject_pool` 出口 0x9 env-skip）。`env_limit` 仍是 Defender 已关闭。完整 operator RIP 劫持 / 真 beacon `sleep` 仍需桌面 C2 会话（§5）。
+2026-08-28 closeout（`windows-closeout` / nyx-ci-test run [33135025777](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135025777)）：同一 job 扩到 8 行。vad / threadless 安全前缀 / fluctuation scratch 均为 100%、0 告警。pool_party 仍 0.0%——08-28 是 notepad 无 TP（缺 `C:\nyx_test\nyx_x64_sleeper.exe`，Windows CI `inject_pool` 出口 0x9 skip），不是产品失败。CI 现部署 sleeper 后的下次 hosted 跑才是 pool_party 实测，本表不预填 100%。`env_limit` 仍是 Defender 已关闭。完整 operator RIP 劫持 / 真 beacon `sleep` 仍需桌面 C2 会话（§5）。
 
 | 日期 | 技术 | EDR（版本） | 投递 | 样本 | 成功率 | 告警 | 环境限制 | 证据 |
 |---|---|---|---|---|---|---|---|---|
 | 2026-08-24 | module_stomp | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | [run 32680867069](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/32680867069) |
-| 2026-08-24 | pool_party | Microsoft Defender 4.18.26070.9 | exe | 1 | 0.0% | 0 | Defender 已关闭 | 同上；exit 0x5 WARN 降级（句柄表偏移已在后续提交修复，复跑待确认） |
+| 2026-08-24 | pool_party | Microsoft Defender 4.18.26070.9 | exe | 1 | 0.0% | 0 | Defender 已关闭 | 同上；08-24 exit 0x5 WARN 降级（句柄表偏移已修）；08-28 0.0% 是 notepad 无 TP（缺 sleeper），不是产品失败；sleeper 部署后的下次 hosted 跑才是实测 |
 | 2026-08-24 | fls_callback | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上；`fls callback inject ok` |
 | 2026-08-24 | hwbp_blind | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
 | 2026-08-24 | indirect_syscall | Microsoft Defender 4.18.26070.9 | exe | 1 | 100.0% | 0 | Defender 已关闭 | 同上 |
@@ -154,7 +154,7 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 |---|---|---|---|
 | module_stomp | `nyx_selftest_inject_armed`（真 stomp 全路径） | `inject 0 <hex> 2`；`inject <pid> <hex> 2` 走现有进程变体 | 目标进程必须 x64（仿真进程），不可注入 ARM64 原生进程 |
 | threadless | `nyx_selftest_inject_threadless`（08-28 安全前缀：牺牲进程 + alloc/write/protect-to-RX + cleanup，1 字节 `ret`，不 RIP 劫持，期望 0x7；hosted 可驱） | `inject 0 <hex> 1` | 仅牺牲进程路径；operator 命令才跑完整 RIP 劫持（需桌面 live C2，不在 hosted job 内） |
-| pool_party | `nyx_selftest_inject_pool`（导出内强制 gate ON；best-effort。0x7 成功 / 0x5 WARN 降级 method 2 = 失败 / 0x9 = 环境 skip：目标无 worker factory 或 OpenProcess 失败） | `inject <pid> <hex> 0`（需构建期 gate + pid≠0） | 响应含 `WARN: Pool Party` 前缀 = 已降级 method 2，本条应记为 pool_party 失败而非成功；0x9 记 skip 而非失败或成功 |
+| pool_party | `nyx_selftest_inject_pool`（导出内强制 gate ON；best-effort。0x7 成功 / 0x5 WARN 降级 method 2 = 失败 / 0x9 = 环境 skip：目标无 worker factory 或 OpenProcess 失败） | `inject <pid> <hex> 0`（需构建期 gate + pid≠0） | 响应含 `WARN: Pool Party` 前缀 = 已降级 method 2，本条应记为 pool_party 失败而非成功；0x9 记 skip 而非失败或成功。08-28 0.0% 是 notepad 无 TP（缺 `C:\nyx_test\nyx_x64_sleeper.exe`）；CI 现部署 sleeper，下次 hosted 跑才是真实测量，不预填 100% |
 | fls_callback | `nyx_selftest_inject_fls`（RUNNING notepad 牺牲进程 + 1 字节 ret 探针） | `inject <pid> <hex> 3` 或 `inject 0 <hex> 3` | 牺牲进程必须 RUNNING（suspended 无 kernel32 映射） |
 | fluctuation | `nyx_selftest_fluctuation`（08-28 安全前缀：scratch 页 NOACCESS→RX 往返；**不**翻转 implant `.text`；期望 0x7；hosted 可驱） | `sleep <秒>` 后观察 beacon 存活与告警 | ARM64 仿真下降级为纯 sleep，`env_limit` 必须标 `Prism 仿真降级`。operator `sleep` 全路径仍需真 C2 会话 |
 | vad | `nyx_selftest_vad`（08-28：walk + image RX + scratch leftover gone，期望 0x7；hosted 可驱） | —（自检，非 inject method） | Session-0 安全；经 nyx-bof-isolated-probe 驱动 |

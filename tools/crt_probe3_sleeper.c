@@ -13,7 +13,10 @@
 // target's worker factory via the system handle table, and a bare process has
 // none until the first work item is submitted.
 //
-// Build: x86_64-w64-mingw32-gcc -O2 -o nyx_x64_sleeper.exe crt_probe3_sleeper.c
+// Build (either compiler; SubmitThreadpoolWork on the default pool creates
+// the worker factory Pool Party scans for):
+//   cl /nologo /O2 /Fe:nyx_x64_sleeper.exe crt_probe3_sleeper.c
+//   x86_64-w64-mingw32-gcc -O2 -o nyx_x64_sleeper.exe crt_probe3_sleeper.c
 // Deploy: C:\nyx_test\nyx_x64_sleeper.exe on the test VM (CRT3_SLEEPER path in
 // selftests.rs).
 #include <windows.h>
@@ -27,17 +30,9 @@ static VOID CALLBACK work_cb(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_
 
 int main(void)
 {
-    PTP_POOL pool = CreateThreadpool(NULL);
-    if (pool) {
-        TP_CALLBACK_ENVIRON env;
-        // mingw-w64 spells the callback-environ inlines TpInitializeCallback-
-        // Environ / TpSetCallbackThreadpool (no underscore after TP).
-        TpInitializeCallbackEnviron(&env);
-        TpSetCallbackThreadpool(&env, pool);
-        PTP_WORK work = CreateThreadpoolWork(work_cb, NULL, &env);
-        if (work) {
-            SubmitThreadpoolWork(work); // forces worker-factory creation
-        }
+    PTP_WORK work = CreateThreadpoolWork(work_cb, NULL, NULL);
+    if (work) {
+        SubmitThreadpoolWork(work); // forces worker-factory creation
     }
     for (;;) {
         Sleep(60 * 1000);

@@ -128,11 +128,45 @@ jobs:
           }
           if (-not (Test-Path "target\release\nyx-bof-isolated-probe.exe")) { Write-Host "::error::probe exe missing"; exit 1 }
 
+      # CRT3 sleeper: pool party (inject method 0) needs a worker factory in
+      # the sacrificial. Hosted images have no C:\nyx_test\nyx_x64_sleeper.exe,
+      # and notepad.exe never submits thread-pool work — so the matrix used
+      # to record pool_party 0.0% (WARN degrade / env skip). Compile before
+      # the Run matrix step (FLS also prefers this path under Prism).
+      - name: Deploy CRT3 sleeper (Pool Party target)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\nyx_test | Out-Null
+          $src = "tools\crt_probe3_sleeper.c"
+          $out = "C:\nyx_test\nyx_x64_sleeper.exe"
+          if (-not (Test-Path $src)) { Write-Host "::error::$src missing"; exit 1 }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { Write-Host "::error::vswhere.exe missing"; exit 1 }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { Write-Host "::error::VS with VC tools not found"; exit 1 }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { Write-Host "::error::vcvars64.bat missing at $vcvars"; exit 1 }
+          # pwsh NativeCommandError trap: cl.exe / vcvars write to stderr.
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            cmd /c "call `"$vcvars`" && cl /nologo /O2 /Fe:$out $src" 2>&1 |
+              Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "cl.exe exited $LASTEXITCODE" }
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
+          if (-not (Test-Path $out)) { Write-Host "::error::sleeper exe missing after compile: $out"; exit 1 }
+          $sz = (Get-Item $out).Length
+          if ($sz -le 0) { Write-Host "::error::sleeper exe is 0 bytes: $out"; exit 1 }
+          Write-Host "CRT3 sleeper OK: $sz bytes at $out"
+
       # Pass masks (scripts/win_selftest_all.ps1 2026-08-24 comments +
       # selftests.rs): armed=0xF, pool=0x7 (0x5 = WARN-degraded to method 2,
-      # recorded as pool_party FAILURE per edr-quant-matrix.md §5; 0x9 =
-      # env skip — no worker factory / OpenProcess, NOT a pass and NOT 0x5;
-      # do not add 0x9 to PassCodes), fls=0x7, hwbp=0xFF, syscall_rt=0b11,
+      # recorded as pool_party FAILURE per edr-quant-matrix.md §5; 0x9 is
+      # not a pass — CRT3 sleeper is deployed above so a worker factory
+      # should exist; 0x9 now means the product still cannot find one.
+      # Do not add 0x9 to PassCodes), fls=0x7, hwbp=0xFF, syscall_rt=0b11,
       # vad=0x7, threadless=0x7, fluctuation=0x7. Hosted runner is native x64
       # Server 2025 — the Prism env-skip codes (0xB/0x1D/0xC1) must NOT
       # appear here.

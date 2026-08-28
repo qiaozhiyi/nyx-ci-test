@@ -288,6 +288,42 @@ jobs:
           # mirror, nyx-ci-test run 31312910796).
           exit 0
 
+      # ---- CRT3 sleeper (Pool Party sacrificial; FLS prefers it under Prism) ----
+      # nyx_selftest_inject_pool / inject_fls look for C:\nyx_test\nyx_x64_sleeper.exe
+      # (CRT3_SLEEPER in selftests.rs). Hosted images do not ship that path, so
+      # pool party used to fall back to notepad.exe — which never calls
+      # CreateThreadpoolWork, so the handle-table scan finds no worker factory
+      # (exit 9 env-skip / matrix 0.0%). Compile the in-tree sleeper with MSVC
+      # before B4 and the 08-28 console selftests so the target actually has a
+      # factory. SubmitThreadpoolWork on the default pool is enough.
+      - name: Deploy CRT3 sleeper (Pool Party target)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\nyx_test | Out-Null
+          $src = "tools\crt_probe3_sleeper.c"
+          $out = "C:\nyx_test\nyx_x64_sleeper.exe"
+          if (-not (Test-Path $src)) { Write-Host "::error::$src missing"; exit 1 }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { Write-Host "::error::vswhere.exe missing"; exit 1 }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { Write-Host "::error::VS with VC tools not found"; exit 1 }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { Write-Host "::error::vcvars64.bat missing at $vcvars"; exit 1 }
+          # pwsh NativeCommandError trap: cl.exe / vcvars write to stderr.
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            cmd /c "call `"$vcvars`" && cl /nologo /O2 /Fe:$out $src" 2>&1 |
+              Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "cl.exe exited $LASTEXITCODE" }
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
+          if (-not (Test-Path $out)) { Write-Host "::error::sleeper exe missing after compile: $out"; exit 1 }
+          $sz = (Get-Item $out).Length
+          if ($sz -le 0) { Write-Host "::error::sleeper exe is 0 bytes: $out"; exit 1 }
+          Write-Host "CRT3 sleeper OK: $sz bytes at $out"
+
       # ---- B4 FLS callback-inject selftest (WP-A, inject method 3) ----
       # nyx_selftest_inject_fls (implant-tasks/src/selftests.rs:667): forces
       # FLS_INJECT_ENABLED on, spawns a RUNNING notepad sacrificial (Session-0
@@ -332,10 +368,10 @@ jobs:
       # Same harness as B3/B4: nyx-bof-isolated-probe LoadLibrary + direct
       # export call (no rundll32 — Session 0 never reaches rundll32 exports).
       # Reuses the probe EXE built in the B3 step and the selftest implant DLL
-      # from the implant build step. HARD gates except inject_pool exit 9
-      # (env skip: no worker factory / OpenProcess), which is a warning.
+      # from the implant build step. CRT3 sleeper is deployed before B4, so
+      # inject_pool must find a worker factory — exit 9 is a product FAIL.
       #   vad / inject_threadless / fluctuation: expect 7 (0b0111)
-      #   inject_pool: 7 pass / 9 env-skip warning / 5 WARN-degrade FAIL
+      #   inject_pool: 7 pass; 9 (no worker factory) FAIL; 5 WARN-degrade FAIL
       #   cfgstage: unpatched CI template first byte 0x41 (65); FAIL on
       #             probe 0xE0/0xE1, timeout, or 0x61-0x64 (locate/decrypt/
       #             parse/empty host).
@@ -380,13 +416,15 @@ jobs:
               if ($code -eq 7) {
                 Write-Host "::notice::$t PASS (mask=7: sacrificial + pool party ok)"
               } elseif ($code -eq 9) {
-                # Env skip (no worker factory / OpenProcess) — not a product fail.
-                Write-Host "::warning::$t exit 9 (env skip: no worker factory / OpenProcess) — not failing the job"
+                # Sleeper is deployed; skip means the product still cannot find
+                # a worker factory. Fail the job (do not treat 9 as env-skip).
+                Write-Host "::error::$t exit 9 (no worker factory / OpenProcess) — CRT3 sleeper is deployed; failing the job"
+                $failed += "$t=9"
               } elseif ($code -eq 5) {
                 Write-Host "::error::$t exit 5 (WARN degrade to method 2) — Pool Party did not run; failing the job"
                 $failed += "$t=5"
               } else {
-                Write-Host "::error::$t expected 7 (pass) or 9 (env skip); got $code"
+                Write-Host "::error::$t expected 7 (pass); got $code"
                 $failed += ("{0}={1}" -f $t, $code)
               }
             } elseif ($t -eq "nyx_selftest_cfgstage") {
@@ -421,7 +459,7 @@ jobs:
           }
           Write-Host "::notice::hosted console selftests PASS (vad/threadless/fluctuation/pool/cfgstage)"
           # pwsh steps fail on a leftover non-zero LASTEXITCODE even without
-          # throw — same trap as B3/B4 (probe expected exits are 7 / 65 / 9).
+          # throw — same trap as B3/B4 (probe expected exits are 7 / 65).
           exit 0
 
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----

