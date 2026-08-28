@@ -415,6 +415,15 @@ jobs:
             Write-Host ("{0} exit: {1} (0b{2} / 0x{1:X})" -f $t, $code, $bits)
 
             if ($t -eq "nyx_selftest_inject_pool") {
+              Write-Host "===== pool markers ($env:TEMP) ====="
+              Get-ChildItem $env:TEMP -Filter 'nyx_g6*' -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host ("--- {0} ---" -f $_.Name)
+                Get-Content $_.FullName -ErrorAction SilentlyContinue
+              }
+              Get-ChildItem $env:TEMP -Filter 'nyx_hold_tp.*' -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host ("--- {0} ---" -f $_.Name)
+                Get-Content $_.FullName -ErrorAction SilentlyContinue
+              }
               if ($code -eq 7) {
                 Write-Host "::notice::$t PASS (mask=7: sacrificial + pool party ok)"
               } elseif ($code -eq 9) {

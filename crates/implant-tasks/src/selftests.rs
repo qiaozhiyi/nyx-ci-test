@@ -657,11 +657,14 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     mask |= 1 << 0;
 
     let _ = unsafe { crate::inject::wait_remote_kernel32(proc.handle) };
-    if let Some(sleep) = k32_fn::<unsafe extern "system" fn(u32)>(b"Sleep") {
-        // Child CRT + CreateThreadpoolWork must finish before the handle-table
-        // walk; 800ms is the inject_fls wait_remote_kernel32 budget class.
-        unsafe { sleep(800) };
-    }
+    let armed = wait_hold_tp_alive(proc.pid);
+    crate::selftests::write_marker(
+        "nyx_g6_inject_pool.handshake",
+        if armed { "armed" } else { "timeout" },
+    );
+    let mut pid_line = String::from("pid=");
+    pid_line.push_str(&dec_u32(proc.pid));
+    crate::selftests::write_marker("nyx_g6_inject_pool.pid", &pid_line);
 
     // Minimal shellcode: `ret` (0xC3). x64 callbacks are caller-cleanup, so
     // a lone ret is a valid empty PTP_WORK_CALLBACK.
@@ -1613,6 +1616,35 @@ fn spawn_probe_hold_tp() -> Option<crate::inject::SacrificialProcess> {
         Ok(p) if p.pid != 0 && p.pid != current_process_id() => Some(p),
         _ => None,
     }
+}
+
+/// Poll `%TEMP%\nyx_hold_tp.<pid>` until the child has submitted thread-pool
+/// work (or 5s elapses). Without this, hijack walks the handle table before
+/// `CreateThreadpoolWork` has run.
+#[cfg(feature = "selftest")]
+fn wait_hold_tp_alive(pid: u32) -> bool {
+    type GetFileAttributesW = unsafe extern "system" fn(*const u16) -> u32;
+    let Some(get) = k32_fn::<GetFileAttributesW>(b"GetFileAttributesW") else {
+        return false;
+    };
+    let tmp = env_var_or(b"TEMP", "C:\\Windows\\Temp");
+    let mut rel = String::from("\\nyx_hold_tp.");
+    rel.push_str(&dec_u32(pid));
+    let path = join(&tmp, &rel);
+    let mut w = nyx_implant_core::heap::vec![0u16; path.len() + 1];
+    for (i, b) in path.as_bytes().iter().enumerate() {
+        w[i] = *b as u16;
+    }
+    let sleep = k32_fn::<unsafe extern "system" fn(u32)>(b"Sleep");
+    for _ in 0..50 {
+        if unsafe { get(w.as_ptr()) } != 0xFFFF_FFFF {
+            return true;
+        }
+        if let Some(s) = sleep {
+            unsafe { s(100) };
+        }
+    }
+    false
 }
 
 #[cfg(feature = "selftest")]

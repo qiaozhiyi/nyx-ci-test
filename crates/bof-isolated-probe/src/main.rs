@@ -57,6 +57,18 @@ unsafe extern "system" fn hold_tp_cb(
     unsafe { Sleep(0xFFFF_FFFF) };
 }
 
+/// Parent `inject_pool` polls `%TEMP%\nyx_hold_tp.<pid>` so it does not
+/// scan the handle table before this child has submitted work.
+#[cfg(target_os = "windows")]
+fn write_hold_tp_alive() {
+    let pid = std::process::id();
+    let tmp = std::env::var("TEMP")
+        .or_else(|_| std::env::var("TMP"))
+        .unwrap_or_else(|_| r"C:\Windows\Temp".into());
+    let path = format!("{}\\nyx_hold_tp.{}", tmp, pid);
+    let _ = std::fs::write(path, b"armed");
+}
+
 /// Sacrificial target for `nyx_selftest_inject_pool`: a *different* PID than
 /// the parent probe, with a live worker factory. Hosted Session 0 proved
 /// CreateThreadpool works inside this binary (CI f0237fe armed in-process,
@@ -74,6 +86,7 @@ fn hold_threadpool() -> ExitCode {
             return ExitCode::from(0xE4);
         }
         SubmitThreadpoolWork(work);
+        write_hold_tp_alive();
         loop {
             Sleep(60_000);
         }

@@ -14,7 +14,7 @@ this file and the code disagree, the code wins.
 
 2026-08-28 hosted-fix（CRT3 sleeper + WFP 出站 + probe `--hold-tp`；Pool Party 证据待下次 nyx-ci-test）：
 
-- **Pool Party**：hosted 未命中先是缺 `C:\nyx_test\nyx_x64_sleeper.exe`（notepad 无 worker factory；SafeBreach/Teach2Breach）。CI 现把 `tools/crt_probe3_sleeper.c` 编到该路径；`inject_pool` 硬期望出口 7。sleeper 在 Session 0 仍 0x9 后改 in-process TP，随后出口 1 / marker `refuse self-inject`。现 `nyx-bof-isolated-probe.exe --hold-tp` 子进程当带线程池的靶（不同 PID）；rundll32 仍回退 sleeper。此前 0x9 skip / 矩阵 0.0% / 出口 1 不改写成产品失败或成功。
+- **Pool Party**：hosted 未命中先是缺 sleeper / notepad 无 TP，再是 `refuse self-inject`，再是 `--hold-tp` 子进程已起仍 0x9（run 33139170290）。产品 `NtQueryInformationWorkerFactory` 用了 SET 类 2（IdleTimeout）而非 SafeBreach QUERY 类 7（`WorkerFactoryBasicInformation`），32 字节缓冲也不够。现 class 7 + 256 字节；句柄发现优先 `ProcessHandleInformation=51`；DuplicateHandle 先要 `WORKER_FACTORY_ALL_ACCESS`；`--hold-tp` 写 `%TEMP%\nyx_hold_tp.<pid>` 再扫表。不预填 100%。
 - **WFP**：hosted `blocked=false` 是 loopback 分类（IS_LOOPBACK / RECV_ACCEPT PERMIT），不是缺 filter。`wfp-selftest` 现测出站 `1.1.1.1:443`（回退 `8.8.8.8`/`9.9.9.9`；无出口记 `env_limit` 退出 6）。Win BYOVD [33136778239](https://github.com/qiaozhiyi/nyx-ci-test/actions/runs/33136778239) 已绿。
 
 2026-08-28 Windows 用户态收口（文档口径，不编造 CI 数字）：
