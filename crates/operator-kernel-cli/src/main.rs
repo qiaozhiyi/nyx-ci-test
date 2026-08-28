@@ -1040,8 +1040,8 @@ fn op_wfp_selftest() -> i32 {
         "[+] wfp-selftest AppId image: {image_path}  probe copy: {}",
         probe.display()
     );
-    if filters != 1 {
-        eprintln!("[!] expected exactly 1 filter, got {filters}");
+    if filters < 1 {
+        eprintln!("[!] expected at least 1 filter, got {filters}");
         drop(guard);
         let _ = idle.kill();
         cleanup(&probe);

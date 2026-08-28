@@ -94,7 +94,7 @@ jobs:
             Write-Host "::warning::WFP self-test skipped ($($r.note)) — env_limit, not a product failure"
             exit 0
           }
-          if ($exit -ne 0 -or -not ($r.baseline -and $r.blocked -and $r.restored -and $r.filters -eq 1)) {
+          if ($exit -ne 0 -or -not ($r.baseline -and $r.blocked -and $r.restored -and $r.filters -ge 1)) {
             Write-Host "::error::WFP self-test failed (exit $exit)"
             exit 1
           }

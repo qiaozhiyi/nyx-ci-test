@@ -102,7 +102,7 @@ if ($LogDir) {
     foreach ($f in @("nyx_matrix_$Technique.out.txt", "nyx_matrix_$Technique.err.txt")) {
         if (Test-Path $f) { Move-Item $f $LogDir -Force }
     }
-    Get-ChildItem "$env:TEMP\nyx_g6_*.resp" -ErrorAction SilentlyContinue |
+    Get-ChildItem "$env:TEMP\nyx_g6_*" -ErrorAction SilentlyContinue |
         Copy-Item -Destination $LogDir -Force
 }
 

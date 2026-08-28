@@ -26,13 +26,27 @@ static VOID CALLBACK work_cb(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_
     (void)instance;
     (void)context;
     (void)work;
+    /* Stay inside a pool thread so the TpWorkerFactory handle remains live
+     * for Pool Party's system-handle-table scan (a callback that returns
+     * immediately can let the default pool drop the factory). */
+    Sleep(INFINITE);
 }
 
 int main(void)
 {
-    PTP_WORK work = CreateThreadpoolWork(work_cb, NULL, NULL);
+    PTP_POOL pool = CreateThreadpool(NULL);
+    TP_CALLBACK_ENVIRON env;
+    PTP_CALLBACK_ENVIRON envp = NULL;
+    if (pool) {
+        SetThreadpoolThreadMinimum(pool, 1);
+        SetThreadpoolThreadMaximum(pool, 2);
+        InitializeThreadpoolEnvironment(&env);
+        SetThreadpoolCallbackPool(&env, pool);
+        envp = &env;
+    }
+    PTP_WORK work = CreateThreadpoolWork(work_cb, NULL, envp);
     if (work) {
-        SubmitThreadpoolWork(work); // forces worker-factory creation
+        SubmitThreadpoolWork(work);
     }
     for (;;) {
         Sleep(60 * 1000);

@@ -499,33 +499,38 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
         // order: filter, then prepared → FwpmFreeMemory0 on the blob). If
         // pid→AppId resolution fails, `?` propagates BEFORE any filter for
         // this rule exists, and `guard`'s Drop rolls back earlier filters.
-        let prepared = PreparedFilter::block_outbound_for_pid(rule.pid)?;
-        let filter = prepared.filter();
-        let mut filter_id: u64 = 0;
-        let st = unsafe {
-            add(
-                guard.engine_handle,
-                &filter,
-                core::ptr::null(),
-                &mut filter_id,
-            )
-        };
-        if st != 0 {
-            // `guard` is dropped here → session closes → partial filters removed.
-            return Err(match wfp_status_env_limit(st) {
-                Some(why) => KitError::Other(format!(
-                    "env_limit:{why} (FwpmFilterAdd0 pid {}={})",
-                    rule.pid, st
-                )),
-                None => KitError::Other(format!(
-                    "FwpmFilterAdd0 failed for pid {}: {}",
-                    rule.pid, st
-                )),
-            });
+        let prepared_list = PreparedFilter::block_outbound_for_pid_all(rule.pid)?;
+        for prepared in prepared_list {
+            let filter = prepared.filter();
+            let mut filter_id: u64 = 0;
+            let st = unsafe {
+                add(
+                    guard.engine_handle,
+                    &filter,
+                    core::ptr::null(),
+                    &mut filter_id,
+                )
+            };
+            if st == FWP_E_ALREADY_EXISTS {
+                continue;
+            }
+            if st != 0 {
+                // `guard` is dropped here → session closes → partial filters removed.
+                return Err(match wfp_status_env_limit(st) {
+                    Some(why) => KitError::Other(format!(
+                        "env_limit:{why} (FwpmFilterAdd0 pid {}={})",
+                        rule.pid, st
+                    )),
+                    None => KitError::Other(format!(
+                        "FwpmFilterAdd0 failed for pid {}: {}",
+                        rule.pid, st
+                    )),
+                });
+            }
+            guard.filter_ids.push(filter_id);
+            guard.app_id_blob_lens.push(prepared.app_id_len);
+            guard.image_paths.push(prepared.image_path.clone());
         }
-        guard.filter_ids.push(filter_id);
-        guard.app_id_blob_lens.push(prepared.app_id_len);
-        guard.image_paths.push(prepared.image_path.clone());
     }
 
     Ok(guard)
@@ -914,6 +919,60 @@ fn resolve_image_path_wide(pid: u32) -> Result<Vec<u16>, KitError> {
     Ok(path)
 }
 
+/// `GetLongPathNameW` / `GetShortPathNameW` — both 3-arg kernel32 APIs.
+#[cfg(target_os = "windows")]
+fn kernel32_expand_path(export: &[u8], src: &[u16]) -> Option<Vec<u16>> {
+    type Expand = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
+    let f: Expand = unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", export).ok()? };
+    let mut buf = [0u16; 1024];
+    let n = unsafe { f(src.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || (n as usize) >= buf.len() {
+        return None;
+    }
+    let mut v = buf[..n as usize].to_vec();
+    if v.last().copied() != Some(0) {
+        v.push(0);
+    }
+    Some(v)
+}
+
+/// Win32 path plus GetLongPathNameW / GetShortPathNameW variants.
+/// Hosted TEMP uses 8.3 `RUNNER~1` while CreateProcess may stamp the long
+/// `runneradmin` image; WFP AppId is an exact NT-path blob, so one variant
+/// missing means the CONNECT classify does not match the filter.
+#[cfg(target_os = "windows")]
+fn win32_path_variants(path: &[u16]) -> Vec<Vec<u16>> {
+    let mut out: Vec<Vec<u16>> = Vec::new();
+    let push = |out: &mut Vec<Vec<u16>>, p: Vec<u16>| {
+        if !out.iter().any(|e| e == &p) {
+            out.push(p);
+        }
+    };
+    push(&mut out, path.to_vec());
+    if let Some(p) = kernel32_expand_path(b"GetLongPathNameW", path) {
+        push(&mut out, p);
+    }
+    if let Some(p) = kernel32_expand_path(b"GetShortPathNameW", path) {
+        push(&mut out, p);
+    }
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn app_id_blob_bytes(blob: *mut FwpByteBlob) -> Vec<u8> {
+    if blob.is_null() {
+        return Vec::new();
+    }
+    unsafe {
+        let n = (*blob).size as usize;
+        if (*blob).data.is_null() || n == 0 {
+            Vec::new()
+        } else {
+            core::slice::from_raw_parts((*blob).data, n).to_vec()
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn wide_nul_to_string(w: &[u16]) -> String {
     let n = w.iter().position(|&c| c == 0).unwrap_or(w.len());
@@ -937,29 +996,33 @@ impl AppIdBlob {
     /// pid → image path → AppId blob. Any failure returns `Err` before a blob
     /// exists — there is no fallback path. Also returns the Win32 image path
     /// and the BFE blob size for live diagnostics.
-    fn for_pid(pid: u32) -> Result<(Self, String, u32), KitError> {
+    fn from_win32_path(path: &[u16]) -> Result<(Self, String, u32), KitError> {
         type FwpmGetAppIdFromFileName0Fn =
             unsafe extern "system" fn(*const u16, *mut *mut FwpByteBlob) -> u32;
         let get_app_id: FwpmGetAppIdFromFileName0Fn = unsafe {
             crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmGetAppIdFromFileName0")
         }
         .map_err(|_| wfp_unresolved("FwpmGetAppIdFromFileName0"))?;
-
-        let path = resolve_image_path_wide(pid)?;
         let mut blob: *mut FwpByteBlob = core::ptr::null_mut();
         let st = unsafe { get_app_id(path.as_ptr(), &mut blob) };
         if st != 0 || blob.is_null() {
             return Err(match wfp_status_env_limit(st) {
                 Some(why) => KitError::Other(format!(
-                    "env_limit:{why} (FwpmGetAppIdFromFileName0 pid {pid}={st})"
+                    "env_limit:{why} (FwpmGetAppIdFromFileName0={st})"
                 )),
-                None => KitError::Other(format!(
-                    "FwpmGetAppIdFromFileName0 failed for pid {pid}: {st}"
-                )),
+                None => KitError::Other(format!("FwpmGetAppIdFromFileName0 failed: {st}")),
             });
         }
         let len = unsafe { (*blob).size };
-        Ok((Self { blob }, wide_nul_to_string(&path), len))
+        Ok((Self { blob }, wide_nul_to_string(path), len))
+    }
+
+    fn for_pid(pid: u32) -> Result<(Self, String, u32), KitError> {
+        let path = resolve_image_path_wide(pid)?;
+        Self::from_win32_path(&path).map_err(|e| match e {
+            KitError::Other(s) => KitError::Other(format!("{s} (pid {pid})")),
+            other => other,
+        })
     }
 }
 
@@ -1017,6 +1080,34 @@ impl PreparedFilter {
             image_path,
             app_id_len,
         })
+    }
+
+    /// One filter per unique AppId blob (queried path + long + 8.3).
+    fn block_outbound_for_pid_all(pid: u32) -> Result<Vec<Self>, KitError> {
+        let path = resolve_image_path_wide(pid)?;
+        let mut out: Vec<Self> = Vec::new();
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        for variant in win32_path_variants(&path) {
+            let Ok((app_id, image_path, app_id_len)) = AppIdBlob::from_win32_path(&variant) else {
+                continue;
+            };
+            let key = app_id_blob_bytes(app_id.blob);
+            if key.is_empty() || seen.iter().any(|s| s == &key) {
+                continue;
+            }
+            seen.push(key);
+            let condition = ale_app_id_condition(app_id.blob);
+            out.push(Self {
+                app_id,
+                condition,
+                image_path,
+                app_id_len,
+            });
+        }
+        if out.is_empty() {
+            out.push(Self::block_outbound_for_pid(pid)?);
+        }
+        Ok(out)
     }
 
     /// The `FWPM_FILTER0` to hand to `FwpmFilterAdd0`. Borrows

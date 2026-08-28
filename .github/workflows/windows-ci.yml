@@ -400,7 +400,9 @@ jobs:
           )
           foreach ($t in $exports) {
             $p = Start-Process $probe -ArgumentList "`"$dll`"",$t -PassThru -WindowStyle Hidden
-            $p.WaitForExit(45000) | Out-Null
+            # inject_pool: 4s settle + handle-table scan; 60s budget.
+            $waitMs = if ($t -eq "nyx_selftest_inject_pool") { 60000 } else { 45000 }
+            $p.WaitForExit($waitMs) | Out-Null
             if (-not $p.HasExited) {
               $p.Kill()
               Write-Host ("{0,-32} TIMEOUT" -f $t)

